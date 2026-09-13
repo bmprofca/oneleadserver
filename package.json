@@ -1,0 +1,40 @@
+{
+  "name": "onelead-server",
+  "version": "1.0.0",
+  "description": "OneLead lead management API",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "init-db": "node scripts/initDb.js",
+    "migrate-products": "node scripts/migrateProducts.js",
+    "migrate-lead-import": "node scripts/migrateLeadImport.js",
+    "migrate-remove-support": "node scripts/migrateRemoveSupport.js",
+    "migrate-appointment-assign": "node scripts/migrateAppointmentAssign.js",
+    "migrate-lead-status-history": "node scripts/migrateLeadStatusHistory.js",
+    "reset-users": "node scripts/resetUsers.js"
+  },
+  "keywords": [
+    "lead",
+    "crm",
+    "express"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-validator": "^7.2.1",
+    "helmet": "^8.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "multer": "^2.3.0",
+    "mysql2": "^3.12.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  }
+}
