@@ -7,6 +7,25 @@ const router = express.Router();
 
 router.use(authenticate);
 
+async function assertProduct(productId) {
+  const id = Number(productId);
+  if (!id) {
+    const err = new Error('Product is required');
+    err.status = 400;
+    throw err;
+  }
+  const [rows] = await pool.query(
+    'SELECT id FROM products WHERE id = ? LIMIT 1',
+    [id]
+  );
+  if (!rows.length) {
+    const err = new Error('Select a valid product');
+    err.status = 400;
+    throw err;
+  }
+  return id;
+}
+
 router.get('/', async (req, res) => {
   try {
     const where = [];
@@ -27,12 +46,22 @@ router.get('/', async (req, res) => {
       params.push(req.query.lead_id);
     }
 
+    if (req.query.product_id) {
+      where.push('r.product_id = ?');
+      params.push(req.query.product_id);
+    }
+
     const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
 
     const [rows] = await pool.query(
-      `SELECT r.*, l.name AS lead_name, l.phone AS lead_phone, u.name AS user_name
+      `SELECT r.*,
+              l.name AS lead_name,
+              l.phone AS lead_phone,
+              p.name AS product_name,
+              u.name AS user_name
        FROM reminders r
        INNER JOIN leads l ON l.id = r.lead_id
+       LEFT JOIN products p ON p.id = r.product_id
        LEFT JOIN users u ON u.id = r.user_id
        ${clause}
        ORDER BY r.remind_at ASC`,
@@ -50,6 +79,7 @@ router.post(
   '/',
   authorize('admin', 'sales'),
   body('lead_id').notEmpty().withMessage('Lead is required'),
+  body('product_id').notEmpty().withMessage('Product is required'),
   body('remind_at').notEmpty().withMessage('Callback date/time is required'),
   body('title').optional().trim(),
   async (req, res) => {
@@ -60,6 +90,7 @@ router.post(
 
     const {
       lead_id,
+      product_id,
       title,
       description = null,
       remind_at,
@@ -70,6 +101,8 @@ router.post(
       req.user.role === 'admin' && user_id ? user_id : req.user.id;
 
     try {
+      const productId = await assertProduct(product_id);
+
       const [lead] = await pool.query(
         'SELECT id, name FROM leads WHERE id = ? LIMIT 1',
         [lead_id]
@@ -84,14 +117,16 @@ router.post(
           : `Callback: ${lead[0].name}`;
 
       const [result] = await pool.query(
-        `INSERT INTO reminders (lead_id, user_id, title, description, remind_at)
-         VALUES (?, ?, ?, ?, ?)`,
-        [lead_id, ownerId, reminderTitle, description, remind_at]
+        `INSERT INTO reminders (lead_id, product_id, user_id, title, description, remind_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [lead_id, productId, ownerId, reminderTitle, description, remind_at]
       );
       return res.status(201).json({ id: result.insertId, message: 'Callback reminder created' });
     } catch (err) {
       console.error(err);
-      return res.status(500).json({ message: 'Failed to create reminder' });
+      return res
+        .status(err.status || 500)
+        .json({ message: err.message || 'Failed to create reminder' });
     }
   }
 );
@@ -111,17 +146,24 @@ router.put('/:id', authorize('admin', 'sales'), async (req, res) => {
     if (req.body.lead_id !== undefined && !req.body.lead_id) {
       return res.status(400).json({ message: 'Lead is required' });
     }
+    if (req.body.product_id !== undefined && !req.body.product_id) {
+      return res.status(400).json({ message: 'Product is required' });
+    }
 
-    const fields = ['title', 'description', 'remind_at', 'lead_id', 'is_completed'];
+    const fields = ['title', 'description', 'remind_at', 'lead_id', 'product_id', 'is_completed'];
     const updates = [];
     const values = [];
 
-    fields.forEach((field) => {
-      if (req.body[field] !== undefined) {
-        updates.push(`${field} = ?`);
-        values.push(req.body[field]);
+    for (const field of fields) {
+      if (req.body[field] === undefined) continue;
+      if (field === 'product_id') {
+        updates.push('product_id = ?');
+        values.push(await assertProduct(req.body.product_id));
+        continue;
       }
-    });
+      updates.push(`${field} = ?`);
+      values.push(req.body[field]);
+    }
 
     if (!updates.length) {
       return res.status(400).json({ message: 'No fields to update' });
@@ -132,7 +174,9 @@ router.put('/:id', authorize('admin', 'sales'), async (req, res) => {
     return res.json({ message: 'Reminder updated' });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ message: 'Failed to update reminder' });
+    return res
+      .status(err.status || 500)
+      .json({ message: err.message || 'Failed to update reminder' });
   }
 });
 

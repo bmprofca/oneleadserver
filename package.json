@@ -13,6 +13,7 @@
     "migrate-appointment-assign": "node scripts/migrateAppointmentAssign.js",
     "migrate-lead-status-history": "node scripts/migrateLeadStatusHistory.js",
     "migrate-sessions": "node scripts/migrateSessions.js",
+    "migrate-reminder-appointment-product": "node scripts/migrateReminderAppointmentProduct.js",
     "reset-users": "node scripts/resetUsers.js"
   },
   "keywords": [
