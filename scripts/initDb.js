@@ -29,6 +29,21 @@ CREATE TABLE IF NOT EXISTS otp_verifications (
   INDEX idx_otp_active (phone, purpose, is_used)
 );
 
+CREATE TABLE IF NOT EXISTS user_sessions (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  token_hash VARCHAR(64) NOT NULL UNIQUE,
+  user_agent VARCHAR(512) NULL,
+  ip_address VARCHAR(64) NULL,
+  last_seen_at DATETIME NOT NULL,
+  expires_at DATETIME NOT NULL,
+  revoked_at DATETIME NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_sessions_user (user_id),
+  INDEX idx_sessions_active (user_id, revoked_at, expires_at),
+  CONSTRAINT fk_sessions_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS products (
   id INT AUTO_INCREMENT PRIMARY KEY,
   name VARCHAR(160) NOT NULL,

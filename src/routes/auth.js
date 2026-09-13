@@ -1,5 +1,4 @@
 const express = require('express');
-const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
 const pool = require('../config/db');
 const { authenticate } = require('../middleware/auth');
@@ -13,15 +12,49 @@ const {
   OTP_TTL_MINUTES,
 } = require('../utils/otp');
 const { sendWhatsAppOtp } = require('../utils/whatsappOtp');
+const {
+  createSessionToken,
+  hashToken,
+  getSessionExpiryDate,
+  summarizeUserAgent,
+  getClientIp,
+} = require('../utils/session');
 
 const router = express.Router();
 
-const signToken = (user) =>
-  jwt.sign(
-    { id: user.id, email: user.email, role: user.role, name: user.name, phone: user.phone },
-    process.env.JWT_SECRET,
-    { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+async function createUserSession(userId, req) {
+  const token = createSessionToken();
+  const tokenHash = hashToken(token);
+  const expiresAt = getSessionExpiryDate();
+  const userAgent = String(req.headers['user-agent'] || '').slice(0, 512) || null;
+  const ipAddress = getClientIp(req);
+
+  const [result] = await pool.query(
+    `INSERT INTO user_sessions
+     (user_id, token_hash, user_agent, ip_address, last_seen_at, expires_at)
+     VALUES (?, ?, ?, ?, NOW(), ?)`,
+    [userId, tokenHash, userAgent, ipAddress, expiresAt]
   );
+
+  return {
+    token,
+    sessionId: result.insertId,
+    expiresAt,
+  };
+}
+
+function mapSessionRow(row, currentSessionId) {
+  return {
+    id: row.id,
+    device: summarizeUserAgent(row.user_agent),
+    userAgent: row.user_agent,
+    ipAddress: row.ip_address,
+    createdAt: row.created_at,
+    lastSeenAt: row.last_seen_at,
+    expiresAt: row.expires_at,
+    current: row.id === currentSessionId,
+  };
+}
 
 router.post(
   '/send-otp',
@@ -56,7 +89,6 @@ router.post(
         return res.status(403).json({ message: 'Account is inactive' });
       }
 
-      // Invalidate previous unused OTPs for this phone
       await pool.query(
         `UPDATE otp_verifications
          SET is_used = 1
@@ -77,7 +109,6 @@ router.post(
 
       const fixed = String(process.env.OTP_FIXED_CODE || '').trim();
       if (fixed) {
-        // Local/dev bypass — OTP not sent over WhatsApp
         return res.json({
           message: 'OTP sent successfully',
           phone,
@@ -179,10 +210,12 @@ router.post(
       }
 
       const user = users[0];
-      const token = signToken(user);
+      const session = await createUserSession(user.id, req);
 
       return res.json({
-        token,
+        token: session.token,
+        sessionId: session.sessionId,
+        expiresAt: session.expiresAt,
         user: {
           id: user.id,
           name: user.name,
@@ -197,6 +230,85 @@ router.post(
     }
   }
 );
+
+router.post('/logout', authenticate, async (req, res) => {
+  try {
+    await pool.query(
+      'UPDATE user_sessions SET revoked_at = NOW() WHERE id = ? AND user_id = ? AND revoked_at IS NULL',
+      [req.sessionId, req.user.id]
+    );
+    return res.json({ message: 'Logged out' });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Failed to log out' });
+  }
+});
+
+router.get('/sessions', authenticate, async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, user_agent, ip_address, last_seen_at, expires_at, created_at
+       FROM user_sessions
+       WHERE user_id = ?
+         AND revoked_at IS NULL
+         AND expires_at > NOW()
+       ORDER BY last_seen_at DESC`,
+      [req.user.id]
+    );
+    return res.json(rows.map((row) => mapSessionRow(row, req.sessionId)));
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Failed to load sessions' });
+  }
+});
+
+router.delete('/sessions/:id', authenticate, async (req, res) => {
+  const sessionId = Number(req.params.id);
+  if (!Number.isInteger(sessionId) || sessionId <= 0) {
+    return res.status(400).json({ message: 'Invalid session id' });
+  }
+
+  try {
+    const [result] = await pool.query(
+      `UPDATE user_sessions
+       SET revoked_at = NOW()
+       WHERE id = ? AND user_id = ? AND revoked_at IS NULL`,
+      [sessionId, req.user.id]
+    );
+
+    if (!result.affectedRows) {
+      return res.status(404).json({ message: 'Session not found' });
+    }
+
+    return res.json({
+      message: 'Session terminated',
+      currentEnded: sessionId === req.sessionId,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Failed to terminate session' });
+  }
+});
+
+router.post('/sessions/revoke-others', authenticate, async (req, res) => {
+  try {
+    const [result] = await pool.query(
+      `UPDATE user_sessions
+       SET revoked_at = NOW()
+       WHERE user_id = ?
+         AND id <> ?
+         AND revoked_at IS NULL`,
+      [req.user.id, req.sessionId]
+    );
+    return res.json({
+      message: 'Other sessions terminated',
+      count: result.affectedRows || 0,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Failed to terminate other sessions' });
+  }
+});
 
 router.get('/me', authenticate, async (req, res) => {
   try {

@@ -29,8 +29,10 @@ async function resetUsers() {
     await connection.query('DELETE FROM reminders');
     await connection.query('DELETE FROM leads');
     await connection.query('DELETE FROM otp_verifications');
+    await connection.query('DELETE FROM user_sessions');
     await connection.query('DELETE FROM users');
     await connection.query('ALTER TABLE users AUTO_INCREMENT = 1');
+    await connection.query('ALTER TABLE user_sessions AUTO_INCREMENT = 1');
     await connection.query('SET FOREIGN_KEY_CHECKS = 1');
 
     await connection.query(

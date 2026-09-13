@@ -12,6 +12,7 @@
     "migrate-remove-support": "node scripts/migrateRemoveSupport.js",
     "migrate-appointment-assign": "node scripts/migrateAppointmentAssign.js",
     "migrate-lead-status-history": "node scripts/migrateLeadStatusHistory.js",
+    "migrate-sessions": "node scripts/migrateSessions.js",
     "reset-users": "node scripts/resetUsers.js"
   },
   "keywords": [
@@ -28,7 +29,6 @@
     "express": "^4.21.2",
     "express-validator": "^7.2.1",
     "helmet": "^8.0.0",
-    "jsonwebtoken": "^9.0.2",
     "morgan": "^1.10.0",
     "multer": "^2.3.0",
     "mysql2": "^3.12.0",
