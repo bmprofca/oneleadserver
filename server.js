@@ -3,15 +3,15 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
-const pool = require('./config/db');
+const pool = require('./src/config/db');
 
-const authRoutes = require('./routes/auth');
-const userRoutes = require('./routes/users');
-const productRoutes = require('./routes/products');
-const leadRoutes = require('./routes/leads');
-const reminderRoutes = require('./routes/reminders');
-const appointmentRoutes = require('./routes/appointments');
-const dashboardRoutes = require('./routes/dashboard');
+const authRoutes = require('./src/routes/auth');
+const userRoutes = require('./src/routes/users');
+const productRoutes = require('./src/routes/products');
+const leadRoutes = require('./src/routes/leads');
+const reminderRoutes = require('./src/routes/reminders');
+const appointmentRoutes = require('./src/routes/appointments');
+const dashboardRoutes = require('./src/routes/dashboard');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
