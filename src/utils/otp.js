@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
+const { addMinutesMysql } = require('./timezone');
 
 const OTP_TTL_MINUTES = Number(process.env.OTP_TTL_MINUTES || 10);
 const OTP_MAX_ATTEMPTS = Number(process.env.OTP_MAX_ATTEMPTS || 5);
@@ -39,7 +40,7 @@ async function compareOtp(otp, otpHash) {
 }
 
 function getOtpExpiryDate() {
-  return new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000);
+  return addMinutesMysql(OTP_TTL_MINUTES);
 }
 
 module.exports = {

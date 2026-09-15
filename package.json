@@ -14,6 +14,9 @@
     "migrate-lead-status-history": "node scripts/migrateLeadStatusHistory.js",
     "migrate-sessions": "node scripts/migrateSessions.js",
     "migrate-reminder-appointment-product": "node scripts/migrateReminderAppointmentProduct.js",
+    "migrate-timezone-ist": "node scripts/migrateTimezoneIst.js",
+    "migrate-status-note-whatsapp": "node scripts/migrateStatusNoteWhatsapp.js",
+    "migrate-not-interested-status": "node scripts/migrateNotInterestedStatus.js",
     "reset-users": "node scripts/resetUsers.js"
   },
   "keywords": [

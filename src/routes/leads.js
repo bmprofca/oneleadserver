@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const express = require('express');
 const multer = require('multer');
 const XLSX = require('xlsx');
@@ -13,14 +14,18 @@ const upload = multer({
 
 router.use(authenticate);
 
-const STATUSES = ['new', 'contacted', 'qualified', 'proposal', 'negotiation', 'won', 'lost'];
+const STATUSES = ['new', 'contacted', 'qualified', 'proposal', 'negotiation', 'won', 'lost', 'not_interested'];
 
-const logStatusChange = async (conn, { leadId, fromStatus, toStatus, changedBy }) => {
+const logStatusChange = async (conn, { leadId, fromStatus, toStatus, changedBy, note }) => {
   if (!toStatus || fromStatus === toStatus) return;
+  const noteText =
+    note === undefined || note === null || String(note).trim() === ''
+      ? null
+      : String(note).trim();
   await conn.query(
-    `INSERT INTO lead_status_history (lead_id, from_status, to_status, changed_by)
-     VALUES (?, ?, ?, ?)`,
-    [leadId, fromStatus || null, toStatus, changedBy || null]
+    `INSERT INTO lead_status_history (lead_id, from_status, to_status, note, changed_by)
+     VALUES (?, ?, ?, ?, ?)`,
+    [leadId, fromStatus || null, toStatus, noteText, changedBy || null]
   );
 };
 
@@ -240,6 +245,100 @@ router.get('/stats', async (req, res) => {
 });
 
 router.post(
+  '/',
+  authorize('admin', 'sales'),
+  body('name').trim().notEmpty().withMessage('Name is required'),
+  body('product_id').notEmpty().withMessage('Product is required'),
+  body('status').optional().isIn(STATUSES),
+  body('phone').optional({ checkFalsy: true }).trim(),
+  body('email').optional({ checkFalsy: true }).isEmail(),
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const {
+      name,
+      phone = null,
+      email = null,
+      address = null,
+      website = null,
+      notes = null,
+      product_id,
+      assigned_to,
+      status = 'new',
+    } = req.body;
+
+    try {
+      const productId = Number(product_id);
+      const [product] = await pool.query(
+        'SELECT id FROM products WHERE id = ? LIMIT 1',
+        [productId]
+      );
+      if (!productId || !product.length) {
+        return res.status(400).json({ message: 'Select a valid product' });
+      }
+
+      let assignee = null;
+      if (req.user.role === 'sales') {
+        assignee = req.user.id;
+      } else if (assigned_to !== '' && assigned_to != null) {
+        assignee = Number(assigned_to);
+        const [salesUser] = await pool.query(
+          `SELECT id FROM users WHERE id = ? AND role = 'sales' AND status = 'active' LIMIT 1`,
+          [assignee]
+        );
+        if (!salesUser.length) {
+          return res.status(400).json({ message: 'Leads can only be assigned to sales users' });
+        }
+      }
+
+      let leadId;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        leadId = `manual_${crypto.randomBytes(10).toString('hex')}`;
+        const [exists] = await pool.query('SELECT id FROM leads WHERE id = ? LIMIT 1', [
+          leadId,
+        ]);
+        if (!exists.length) break;
+        leadId = null;
+      }
+      if (!leadId) {
+        return res.status(500).json({ message: 'Failed to generate lead id' });
+      }
+
+      await pool.query(
+        `INSERT INTO leads (
+           id, product_id, name, email, phone, address, website,
+           source, status, assigned_to, notes, created_by, whatsapp_active
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, 0)`,
+        [
+          leadId,
+          productId,
+          name.trim(),
+          email || null,
+          phone || null,
+          address || null,
+          website || null,
+          status || 'new',
+          assignee,
+          notes || null,
+          req.user.id,
+        ]
+      );
+
+      return res.status(201).json({ id: leadId, message: 'Lead created' });
+    } catch (err) {
+      console.error(err);
+      if (err.code === 'ER_DUP_ENTRY') {
+        return res.status(409).json({ message: 'Lead id already exists, try again' });
+      }
+      return res.status(500).json({ message: 'Failed to create lead' });
+    }
+  }
+);
+
+router.post(
   '/import',
   authorize('admin', 'sales'),
   upload.single('file'),
@@ -382,14 +481,14 @@ router.post(
   '/bulk',
   authorize('admin', 'sales'),
   body('ids').isArray({ min: 1 }),
-  body('action').isIn(['assign', 'status', 'delete']),
+  body('action').isIn(['assign', 'status', 'delete', 'whatsapp']),
   async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { ids, action, assigned_to, status } = req.body;
+    const { ids, action, assigned_to, status, note, whatsapp_active } = req.body;
 
     try {
       if (action === 'delete') {
@@ -457,10 +556,36 @@ router.post(
             fromStatus: row.status,
             toStatus: status,
             changedBy: req.user.id,
+            note,
           });
         }
 
         return res.json({ message: `${ids.length} lead(s) updated` });
+      }
+
+      if (action === 'whatsapp') {
+        const active =
+          whatsapp_active === true ||
+          whatsapp_active === 1 ||
+          whatsapp_active === '1' ||
+          whatsapp_active === 'true';
+        const value = active ? 1 : 0;
+
+        const where = ['id IN (?)'];
+        const params = [ids];
+        if (req.user.role === 'sales') {
+          where.push('assigned_to = ?');
+          params.push(req.user.id);
+        }
+
+        await pool.query(
+          `UPDATE leads SET whatsapp_active = ? WHERE ${where.join(' AND ')}`,
+          [value, ...params]
+        );
+
+        return res.json({
+          message: `${ids.length} lead(s) marked WhatsApp ${active ? 'active' : 'inactive'}`,
+        });
       }
 
       return res.status(400).json({ message: 'Invalid action' });
@@ -565,6 +690,7 @@ router.put(
         'address',
         'website',
         'name',
+        'whatsapp_active',
       ];
       const updates = [];
       const values = [];
@@ -592,6 +718,16 @@ router.put(
           values.push(assignee);
           continue;
         }
+        if (field === 'whatsapp_active') {
+          const active =
+            req.body.whatsapp_active === true ||
+            req.body.whatsapp_active === 1 ||
+            req.body.whatsapp_active === '1' ||
+            req.body.whatsapp_active === 'true';
+          updates.push('whatsapp_active = ?');
+          values.push(active ? 1 : 0);
+          continue;
+        }
         updates.push(`${field} = ?`);
         values.push(req.body[field] === '' ? null : req.body[field]);
       }
@@ -609,6 +745,7 @@ router.put(
           fromStatus: previousStatus,
           toStatus: req.body.status,
           changedBy: req.user.id,
+          note: req.body.status_note,
         });
       }
 

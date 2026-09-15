@@ -1,3 +1,4 @@
+process.env.TZ = process.env.TZ || 'Asia/Kolkata';
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -24,7 +25,11 @@ app.use(
   })
 );
 app.use(express.json());
-app.use(morgan('dev'));
+app.use(
+  morgan('dev', {
+    skip: (req, res) => res.statusCode < 400,
+  })
+);
 
 app.get('/api/health', async (req, res) => {
   try {

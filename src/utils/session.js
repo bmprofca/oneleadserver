@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { addDaysMysql } = require('./timezone');
 
 function getSessionTtlDays() {
   const days = Number(process.env.SESSION_TTL_DAYS || 30);
@@ -13,10 +14,8 @@ function hashToken(token) {
   return crypto.createHash('sha256').update(String(token)).digest('hex');
 }
 
-function getSessionExpiryDate(from = new Date()) {
-  const expires = new Date(from);
-  expires.setDate(expires.getDate() + getSessionTtlDays());
-  return expires;
+function getSessionExpiryDate() {
+  return addDaysMysql(getSessionTtlDays());
 }
 
 function summarizeUserAgent(ua = '') {

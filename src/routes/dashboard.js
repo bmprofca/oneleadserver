@@ -1,6 +1,7 @@
 const express = require('express');
 const pool = require('../config/db');
 const { authenticate } = require('../middleware/auth');
+const { formatMysqlDateTime } = require('../utils/timezone');
 
 const router = express.Router();
 
@@ -29,7 +30,7 @@ router.get('/', async (req, res) => {
       `SELECT status, COUNT(*) AS total
        FROM leads ${leadFilter}
        GROUP BY status
-       ORDER BY FIELD(status, 'new','contacted','qualified','proposal','negotiation','won','lost')`,
+       ORDER BY FIELD(status, 'new','contacted','qualified','proposal','negotiation','won','lost','not_interested')`,
       leadParams
     );
 
@@ -73,13 +74,15 @@ router.get('/', async (req, res) => {
     const calendarEnd = new Date();
     calendarEnd.setHours(0, 0, 0, 0);
     calendarEnd.setDate(calendarEnd.getDate() + 22);
+    const calendarStartSql = formatMysqlDateTime(calendarStart);
+    const calendarEndSql = formatMysqlDateTime(calendarEnd);
 
     const calendarWhere = isSales
       ? 'WHERE a.user_id = ? AND a.start_at >= ? AND a.start_at < ?'
       : 'WHERE a.start_at >= ? AND a.start_at < ?';
     const calendarParams = isSales
-      ? [req.user.id, calendarStart, calendarEnd]
-      : [calendarStart, calendarEnd];
+      ? [req.user.id, calendarStartSql, calendarEndSql]
+      : [calendarStartSql, calendarEndSql];
 
     const [calendarAppointments] = await pool.query(
       `SELECT a.id, a.title, a.start_at, a.end_at, a.status, a.platform,

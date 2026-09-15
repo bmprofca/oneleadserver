@@ -52,9 +52,14 @@ router.get('/', async (req, res) => {
     }
 
     const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const paginate = req.query.page !== undefined || req.query.limit !== undefined;
+    const pageNum = Math.max(1, Number(req.query.page) || 1);
+    const pageSize = [5, 10, 20, 50, 100].includes(Number(req.query.limit))
+      ? Number(req.query.limit)
+      : 20;
+    const offset = (pageNum - 1) * pageSize;
 
-    const [rows] = await pool.query(
-      `SELECT r.*,
+    const selectSql = `SELECT r.*,
               l.name AS lead_name,
               l.phone AS lead_phone,
               p.name AS product_name,
@@ -64,10 +69,32 @@ router.get('/', async (req, res) => {
        LEFT JOIN products p ON p.id = r.product_id
        LEFT JOIN users u ON u.id = r.user_id
        ${clause}
-       ORDER BY r.remind_at ASC`,
-      params
-    );
+       ORDER BY r.remind_at ASC`;
 
+    if (paginate) {
+      const [countRows] = await pool.query(
+        `SELECT COUNT(*) AS total
+         FROM reminders r
+         INNER JOIN leads l ON l.id = r.lead_id
+         ${clause}`,
+        params
+      );
+      const total = countRows[0].total || 0;
+      const [rows] = await pool.query(`${selectSql} LIMIT ? OFFSET ?`, [
+        ...params,
+        pageSize,
+        offset,
+      ]);
+      return res.json({
+        items: rows,
+        total,
+        page: pageNum,
+        limit: pageSize,
+        totalPages: Math.max(1, Math.ceil(total / pageSize)),
+      });
+    }
+
+    const [rows] = await pool.query(selectSql, params);
     return res.json(rows);
   } catch (err) {
     console.error(err);
