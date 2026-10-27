@@ -1,230 +1,227 @@
 const express = require('express');
-const { body, validationResult } = require('express-validator');
+const { body } = require('express-validator');
 const pool = require('../config/db');
 const { authenticate, authorize } = require('../middleware/auth');
+const { asyncHandler, validate, parsePagination, pageResult, badRequest, forbidden, notFound, toBool, emptyToNull } = require('../lib/http');
+const { getLeadForUser, assertProduct, touchActivity } = require('../services/leads');
+const { formatMysqlDateTime } = require('../utils/timezone');
 
 const router = express.Router();
-
 router.use(authenticate);
 
-async function assertProduct(productId) {
-  const id = Number(productId);
-  if (!id) {
-    const err = new Error('Product is required');
-    err.status = 400;
-    throw err;
-  }
-  const [rows] = await pool.query(
-    'SELECT id FROM products WHERE id = ? LIMIT 1',
-    [id]
-  );
-  if (!rows.length) {
-    const err = new Error('Select a valid product');
-    err.status = 400;
-    throw err;
-  }
-  return id;
+const PRIORITIES = ['low', 'normal', 'high'];
+
+async function getOwnedReminder(id, user) {
+  const [rows] = await pool.query('SELECT * FROM reminders WHERE id = ? LIMIT 1', [id]);
+  if (!rows.length) throw notFound('Reminder not found');
+  if (user.role !== 'admin' && rows[0].user_id !== user.id) throw forbidden();
+  return rows[0];
 }
 
-router.get('/', async (req, res) => {
-  try {
+async function resolveOwner(req, userId) {
+  if (req.user.role !== 'admin' || !userId) return req.user.id;
+  const [rows] = await pool.query(`SELECT id FROM users WHERE id = ? AND status = 'active' LIMIT 1`, [Number(userId)]);
+  if (!rows.length) throw badRequest('Select an active user');
+  return rows[0].id;
+}
+
+router.get(
+  '/',
+  asyncHandler(async (req, res) => {
     const where = [];
     const params = [];
-
     if (req.user.role !== 'admin') {
       where.push('r.user_id = ?');
       params.push(req.user.id);
+    } else if (req.query.user_id) {
+      where.push('r.user_id = ?');
+      params.push(Number(req.query.user_id));
     }
-
     if (req.query.completed !== undefined) {
       where.push('r.is_completed = ?');
       params.push(req.query.completed === 'true' ? 1 : 0);
     }
-
     if (req.query.lead_id) {
       where.push('r.lead_id = ?');
       params.push(req.query.lead_id);
     }
-
     if (req.query.product_id) {
       where.push('r.product_id = ?');
       params.push(req.query.product_id);
     }
-
-    const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-    const paginate = req.query.page !== undefined || req.query.limit !== undefined;
-    const pageNum = Math.max(1, Number(req.query.page) || 1);
-    const pageSize = [5, 10, 20, 50, 100].includes(Number(req.query.limit))
-      ? Number(req.query.limit)
-      : 20;
-    const offset = (pageNum - 1) * pageSize;
-
-    const selectSql = `SELECT r.*,
-              l.name AS lead_name,
-              l.phone AS lead_phone,
-              p.name AS product_name,
-              u.name AS user_name
-       FROM reminders r
-       INNER JOIN leads l ON l.id = r.lead_id
-       LEFT JOIN products p ON p.id = r.product_id
-       LEFT JOIN users u ON u.id = r.user_id
-       ${clause}
-       ORDER BY r.remind_at ASC`;
-
-    if (paginate) {
-      const [countRows] = await pool.query(
-        `SELECT COUNT(*) AS total
-         FROM reminders r
-         INNER JOIN leads l ON l.id = r.lead_id
-         ${clause}`,
-        params
-      );
-      const total = countRows[0].total || 0;
-      const [rows] = await pool.query(`${selectSql} LIMIT ? OFFSET ?`, [
-        ...params,
-        pageSize,
-        offset,
-      ]);
-      return res.json({
-        items: rows,
-        total,
-        page: pageNum,
-        limit: pageSize,
-        totalPages: Math.max(1, Math.ceil(total / pageSize)),
-      });
+    if (req.user.role === 'admin' && req.query.assigned_to) {
+      where.push('l.assigned_to = ?');
+      params.push(Number(req.query.assigned_to));
+    }
+    // Custom date range on the callback time (India dates, inclusive).
+    const DATE = /^\d{4}-\d{2}-\d{2}$/;
+    if (req.query.from && DATE.test(req.query.from)) {
+      where.push('r.remind_at >= ?');
+      params.push(`${req.query.from} 00:00:00`);
+    }
+    if (req.query.to && DATE.test(req.query.to)) {
+      where.push('r.remind_at < ? + INTERVAL 1 DAY');
+      params.push(`${req.query.to} 00:00:00`);
+    }
+    if (req.query.priority && PRIORITIES.includes(req.query.priority)) {
+      where.push('r.priority = ?');
+      params.push(req.query.priority);
+    }
+    if (req.query.due === 'overdue') where.push('r.is_completed = 0 AND r.remind_at < NOW()');
+    if (req.query.due === 'today') where.push('DATE(r.remind_at) = CURDATE()');
+    if (req.query.due === 'upcoming') where.push('r.is_completed = 0 AND r.remind_at >= NOW()');
+    if (req.query.search) {
+      where.push('(r.title LIKE ? OR l.name LIKE ? OR l.phone LIKE ?)');
+      const like = `%${req.query.search}%`;
+      params.push(like, like, like);
     }
 
+    const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const order = req.query.completed === 'true' ? 'r.completed_at DESC, r.remind_at DESC' : 'r.is_completed ASC, r.remind_at ASC';
+    const selectSql = `SELECT r.*,
+        l.name AS lead_name, l.phone AS lead_phone, l.status AS lead_status, l.archived_at AS lead_archived_at,
+        l.whatsapp_active AS lead_whatsapp, l.address AS lead_address, l.maps_url AS lead_maps_url,
+        l.business_profile_url AS lead_business_profile_url, l.latitude AS lead_latitude, l.longitude AS lead_longitude,
+        l.assigned_to AS lead_assigned_to, au.name AS lead_assigned_name,
+        p.name AS product_name, u.name AS user_name
+      FROM reminders r
+      INNER JOIN leads l ON l.id = r.lead_id
+      LEFT JOIN products p ON p.id = r.product_id
+      LEFT JOIN users u ON u.id = r.user_id
+      LEFT JOIN users au ON au.id = l.assigned_to
+      ${clause}
+      ORDER BY ${order}`;
+
+    const pg = parsePagination(req.query);
+    if (pg.paginate) {
+      const [[{ total }]] = await pool.query(
+        `SELECT COUNT(*) AS total FROM reminders r INNER JOIN leads l ON l.id = r.lead_id ${clause}`,
+        params
+      );
+      const [rows] = await pool.query(`${selectSql} LIMIT ? OFFSET ?`, [...params, pg.limit, pg.offset]);
+      return res.json(pageResult(rows, total, pg));
+    }
     const [rows] = await pool.query(selectSql, params);
     return res.json(rows);
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ message: 'Failed to fetch reminders' });
-  }
-});
+  })
+);
 
 router.post(
   '/',
   authorize('admin', 'sales'),
   body('lead_id').notEmpty().withMessage('Lead is required'),
-  body('product_id').notEmpty().withMessage('Product is required'),
   body('remind_at').notEmpty().withMessage('Callback date/time is required'),
+  body('priority').optional().isIn(PRIORITIES),
   body('title').optional().trim(),
-  async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
+  validate,
+  asyncHandler(async (req, res) => {
+    const { lead_id: leadId, title, description = null, remind_at: remindAt, user_id: userId, priority = 'normal' } = req.body;
+    // Sales users may only schedule callbacks on their own leads.
+    const lead = await getLeadForUser(leadId, req.user, pool, { includeArchived: false });
+    // A callback is always for the lead's own product.
+    const productId = await assertProduct(lead.product_id);
+    const ownerId = await resolveOwner(req, userId);
+    const reminderTitle = title && title.trim() ? title.trim() : `Callback: ${lead.name}`;
 
-    const {
-      lead_id,
-      product_id,
-      title,
-      description = null,
-      remind_at,
-      user_id,
-    } = req.body;
-
-    const ownerId =
-      req.user.role === 'admin' && user_id ? user_id : req.user.id;
-
-    try {
-      const productId = await assertProduct(product_id);
-
-      const [lead] = await pool.query(
-        'SELECT id, name FROM leads WHERE id = ? LIMIT 1',
-        [lead_id]
-      );
-      if (!lead.length) {
-        return res.status(400).json({ message: 'Select a valid lead' });
-      }
-
-      const reminderTitle =
-        title && title.trim()
-          ? title.trim()
-          : `Callback: ${lead[0].name}`;
-
-      const [result] = await pool.query(
-        `INSERT INTO reminders (lead_id, product_id, user_id, title, description, remind_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [lead_id, productId, ownerId, reminderTitle, description, remind_at]
-      );
-      return res.status(201).json({ id: result.insertId, message: 'Callback reminder created' });
-    } catch (err) {
-      console.error(err);
-      return res
-        .status(err.status || 500)
-        .json({ message: err.message || 'Failed to create reminder' });
-    }
-  }
+    const [result] = await pool.query(
+      `INSERT INTO reminders (lead_id, product_id, user_id, title, description, priority, remind_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [lead.id, productId, ownerId, reminderTitle, emptyToNull(description), priority, remindAt]
+    );
+    await touchActivity(lead.id);
+    return res.status(201).json({ id: result.insertId, message: 'Callback reminder created' });
+  })
 );
 
-router.put('/:id', authorize('admin', 'sales'), async (req, res) => {
-  try {
-    const [existing] = await pool.query('SELECT * FROM reminders WHERE id = ? LIMIT 1', [
-      req.params.id,
-    ]);
-    if (!existing.length) {
-      return res.status(404).json({ message: 'Reminder not found' });
-    }
-    if (req.user.role !== 'admin' && existing[0].user_id !== req.user.id) {
-      return res.status(403).json({ message: 'Access denied' });
-    }
+router.put(
+  '/:id',
+  authorize('admin', 'sales'),
+  body('priority').optional().isIn(PRIORITIES),
+  validate,
+  asyncHandler(async (req, res) => {
+    const existing = await getOwnedReminder(req.params.id, req.user);
+    if (req.body.lead_id !== undefined && !req.body.lead_id) throw badRequest('Lead is required');
 
-    if (req.body.lead_id !== undefined && !req.body.lead_id) {
-      return res.status(400).json({ message: 'Lead is required' });
+    const changes = {};
+    for (const field of ['title', 'description', 'remind_at', 'priority']) {
+      if (req.body[field] !== undefined) changes[field] = emptyToNull(req.body[field]);
     }
-    if (req.body.product_id !== undefined && !req.body.product_id) {
-      return res.status(400).json({ message: 'Product is required' });
+    if (changes.title === null) throw badRequest('Title is required');
+    // The product can't be picked separately: it always follows the lead.
+    if (req.body.lead_id !== undefined) {
+      const lead = await getLeadForUser(req.body.lead_id, req.user);
+      changes.lead_id = lead.id;
+      changes.product_id = lead.product_id;
     }
-
-    const fields = ['title', 'description', 'remind_at', 'lead_id', 'product_id', 'is_completed'];
-    const updates = [];
-    const values = [];
-
-    for (const field of fields) {
-      if (req.body[field] === undefined) continue;
-      if (field === 'product_id') {
-        updates.push('product_id = ?');
-        values.push(await assertProduct(req.body.product_id));
-        continue;
-      }
-      updates.push(`${field} = ?`);
-      values.push(req.body[field]);
+    if (req.body.user_id !== undefined && req.user.role === 'admin') changes.user_id = await resolveOwner(req, req.body.user_id);
+    if (req.body.is_completed !== undefined) {
+      const done = toBool(req.body.is_completed);
+      changes.is_completed = done ? 1 : 0;
+      if (done && !existing.is_completed) changes.completed_at = formatMysqlDateTime();
+      if (!done) changes.completed_at = null;
     }
+    if (!Object.keys(changes).length) throw badRequest('No fields to update');
 
-    if (!updates.length) {
-      return res.status(400).json({ message: 'No fields to update' });
-    }
-
-    values.push(req.params.id);
-    await pool.query(`UPDATE reminders SET ${updates.join(', ')} WHERE id = ?`, values);
+    await pool.query('UPDATE reminders SET ? WHERE id = ?', [changes, req.params.id]);
+    if (changes.is_completed) await touchActivity(existing.lead_id);
     return res.json({ message: 'Reminder updated' });
-  } catch (err) {
-    console.error(err);
-    return res
-      .status(err.status || 500)
-      .json({ message: err.message || 'Failed to update reminder' });
-  }
-});
+  })
+);
 
-router.delete('/:id', authorize('admin', 'sales'), async (req, res) => {
-  try {
-    const [existing] = await pool.query('SELECT * FROM reminders WHERE id = ? LIMIT 1', [
-      req.params.id,
-    ]);
-    if (!existing.length) {
-      return res.status(404).json({ message: 'Reminder not found' });
+/** Complete a callback, optionally logging what happened on the lead's timeline. */
+router.post(
+  '/:id/complete',
+  authorize('admin', 'sales'),
+  asyncHandler(async (req, res) => {
+    const reminder = await getOwnedReminder(req.params.id, req.user);
+    await pool.query('UPDATE reminders SET is_completed = 1, completed_at = NOW() WHERE id = ?', [reminder.id]);
+    const outcome = emptyToNull(req.body.outcome);
+    const note = emptyToNull(req.body.note);
+    if (outcome || note) {
+      const type = ['call', 'message', 'email', 'note', 'whatsapp', 'meeting'].includes(req.body.type) ? req.body.type : 'call';
+      await pool.query(
+        `INSERT INTO communications (lead_id, user_id, type, direction, subject, content, outcome, occurred_at)
+         VALUES (?, ?, ?, 'outbound', ?, ?, ?, NOW())`,
+        [reminder.lead_id, req.user.id, type, reminder.title, note, outcome]
+      );
     }
-    if (req.user.role !== 'admin' && existing[0].user_id !== req.user.id) {
-      return res.status(403).json({ message: 'Access denied' });
-    }
+    await touchActivity(reminder.lead_id);
+    return res.json({ message: 'Callback completed' });
+  })
+);
 
+/** Push a callback later: { minutes } or { until: 'YYYY-MM-DD HH:mm:ss' }. */
+router.post(
+  '/:id/snooze',
+  authorize('admin', 'sales'),
+  asyncHandler(async (req, res) => {
+    const reminder = await getOwnedReminder(req.params.id, req.user);
+    let until;
+    if (req.body.until) {
+      const text = String(req.body.until).trim().replace('T', ' ');
+      const match = /^(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2})(?::(\d{2}))?$/.exec(text);
+      const parsed = match ? new Date(`${match[1]}T${match[2]}:${match[3]}:${match[4] || '00'}+05:30`) : null;
+      if (!parsed || Number.isNaN(parsed.getTime())) throw badRequest('Snooze time must be YYYY-MM-DD HH:mm:ss');
+      if (parsed.getTime() <= Date.now()) throw badRequest('Snooze time must be in the future');
+      until = formatMysqlDateTime(parsed);
+    } else {
+      const minutes = Number(req.body.minutes);
+      if (!minutes || minutes < 1 || minutes > 60 * 24 * 30) throw badRequest('Choose how long to snooze');
+      until = formatMysqlDateTime(new Date(Date.now() + minutes * 60000));
+    }
+    await pool.query('UPDATE reminders SET remind_at = ?, is_completed = 0, completed_at = NULL WHERE id = ?', [until, reminder.id]);
+    return res.json({ message: 'Callback snoozed', remind_at: until });
+  })
+);
+
+router.delete(
+  '/:id',
+  authorize('admin', 'sales'),
+  asyncHandler(async (req, res) => {
+    await getOwnedReminder(req.params.id, req.user);
     await pool.query('DELETE FROM reminders WHERE id = ?', [req.params.id]);
     return res.json({ message: 'Reminder deleted' });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ message: 'Failed to delete reminder' });
-  }
-});
+  })
+);
 
 module.exports = router;

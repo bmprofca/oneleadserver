@@ -2,9 +2,42 @@ const crypto = require('crypto');
 const express = require('express');
 const multer = require('multer');
 const XLSX = require('xlsx');
-const { body, validationResult } = require('express-validator');
+const { body } = require('express-validator');
 const pool = require('../config/db');
 const { authenticate, authorize } = require('../middleware/auth');
+const {
+  asyncHandler,
+  validate,
+  parsePagination,
+  pageResult,
+  badRequest,
+  forbidden,
+  notFound,
+  conflict,
+  toBool,
+  emptyToNull,
+} = require('../lib/http');
+const {
+  STATUSES,
+  OPEN_STATUSES,
+  STAGE_PROBABILITY,
+  SORTS,
+  LEAD_SELECT,
+  scoreSql,
+  normalizePhone,
+  hydrateLead,
+  buildLeadFilters,
+  getLeadForUser,
+  logStatusChange,
+  assertSalesUser,
+  assertProduct,
+  findDuplicates,
+  findPhoneProductLead,
+  setLeadTags,
+} = require('../services/leads');
+const { nextAssignees } = require('../services/assignment');
+const { audit, diff } = require('../services/audit');
+const settings = require('../services/settings');
 
 const router = express.Router();
 const upload = multer({
@@ -13,56 +46,6 @@ const upload = multer({
 });
 
 router.use(authenticate);
-
-const STATUSES = ['new', 'contacted', 'qualified', 'proposal', 'negotiation', 'won', 'lost', 'not_interested'];
-
-const logStatusChange = async (conn, { leadId, fromStatus, toStatus, changedBy, note }) => {
-  if (!toStatus || fromStatus === toStatus) return;
-  const noteText =
-    note === undefined || note === null || String(note).trim() === ''
-      ? null
-      : String(note).trim();
-  await conn.query(
-    `INSERT INTO lead_status_history (lead_id, from_status, to_status, note, changed_by)
-     VALUES (?, ?, ?, ?, ?)`,
-    [leadId, fromStatus || null, toStatus, noteText, changedBy || null]
-  );
-};
-
-const getLeadRelationCounts = async (leadId) => {
-  const [[reminders]] = await pool.query(
-    'SELECT COUNT(*) AS total FROM reminders WHERE lead_id = ?',
-    [leadId]
-  );
-  const [[appointments]] = await pool.query(
-    'SELECT COUNT(*) AS total FROM appointments WHERE lead_id = ?',
-    [leadId]
-  );
-  const [[communications]] = await pool.query(
-    'SELECT COUNT(*) AS total FROM communications WHERE lead_id = ?',
-    [leadId]
-  );
-  return {
-    reminders: Number(reminders.total) || 0,
-    appointments: Number(appointments.total) || 0,
-    communications: Number(communications.total) || 0,
-  };
-};
-
-const assertLeadDeletable = async (leadId) => {
-  const counts = await getLeadRelationCounts(leadId);
-  const blockers = [];
-  if (counts.reminders) blockers.push(`${counts.reminders} reminder(s)`);
-  if (counts.appointments) blockers.push(`${counts.appointments} appointment(s)`);
-  if (counts.communications) blockers.push(`${counts.communications} communication(s)`);
-  if (blockers.length) {
-    const err = new Error(
-      `Cannot delete this lead because it has ${blockers.join(', ')}. Remove those records first.`
-    );
-    err.status = 409;
-    throw err;
-  }
-};
 
 const pickFirstEmail = (value) => {
   if (!value || String(value).includes('Waiting for processing')) return null;
@@ -80,169 +63,356 @@ const cleanText = (value) => {
   return text;
 };
 
-router.get('/', async (req, res) => {
-  try {
-    const { status, search, assigned_to, product_id, page, limit } = req.query;
-    const where = [];
-    const params = [];
+const parseMoney = (value) => {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return null;
+  const n = Number(String(value).replace(/[,\s₹]/g, ''));
+  if (!Number.isFinite(n) || n < 0) throw badRequest('Deal value must be a positive number');
+  return Math.round(n * 100) / 100;
+};
 
-    if (req.user.role === 'sales') {
-      where.push('l.assigned_to = ?');
-      params.push(req.user.id);
+const parseDate = (value) => {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return null;
+  const text = String(value).slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) throw badRequest('Expected close date must be YYYY-MM-DD');
+  return text;
+};
+
+const parseIds = (raw) => {
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [raw];
+    } catch {
+      return raw.split(',').map((v) => v.trim());
     }
-
-    if (status) {
-      where.push('l.status = ?');
-      params.push(status);
-    }
-
-    if (product_id) {
-      where.push('l.product_id = ?');
-      params.push(product_id);
-    }
-
-    if (assigned_to === 'unassigned') {
-      where.push('l.assigned_to IS NULL');
-    } else if (assigned_to && req.user.role !== 'sales') {
-      where.push('l.assigned_to = ?');
-      params.push(assigned_to);
-    }
-
-    if (search) {
-      where.push(
-        '(l.name LIKE ? OR l.email LIKE ? OR l.phone LIKE ? OR l.company LIKE ? OR l.id LIKE ? OR l.address LIKE ?)'
-      );
-      const like = `%${search}%`;
-      params.push(like, like, like, like, like, like);
-    }
-
-    const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-    const paginate = page !== undefined || limit !== undefined;
-    const pageNum = Math.max(1, Number(page) || 1);
-    const pageSize = [5, 10, 20, 50, 100].includes(Number(limit))
-      ? Number(limit)
-      : 20;
-    const offset = (pageNum - 1) * pageSize;
-
-    if (paginate) {
-      const [countRows] = await pool.query(
-        `SELECT COUNT(*) AS total FROM leads l ${clause}`,
-        params
-      );
-      const total = countRows[0].total || 0;
-
-      const [rows] = await pool.query(
-        `SELECT l.*,
-                u.name AS assigned_name,
-                c.name AS created_by_name,
-                p.name AS product_name,
-                (
-                  SELECT r.remind_at
-                  FROM reminders r
-                  WHERE r.lead_id = l.id AND r.is_completed = 0
-                  ORDER BY r.remind_at ASC
-                  LIMIT 1
-                ) AS next_callback
-         FROM leads l
-         LEFT JOIN users u ON u.id = l.assigned_to
-         LEFT JOIN users c ON c.id = l.created_by
-         LEFT JOIN products p ON p.id = l.product_id
-         ${clause}
-         ORDER BY l.updated_at DESC
-         LIMIT ? OFFSET ?`,
-        [...params, pageSize, offset]
-      );
-
-      return res.json({
-        items: rows,
-        total,
-        page: pageNum,
-        limit: pageSize,
-        totalPages: Math.max(1, Math.ceil(total / pageSize)),
-      });
-    }
-
-    const [rows] = await pool.query(
-      `SELECT l.*,
-              u.name AS assigned_name,
-              c.name AS created_by_name,
-              p.name AS product_name,
-              (
-                SELECT r.remind_at
-                FROM reminders r
-                WHERE r.lead_id = l.id AND r.is_completed = 0
-                ORDER BY r.remind_at ASC
-                LIMIT 1
-              ) AS next_callback
-       FROM leads l
-       LEFT JOIN users u ON u.id = l.assigned_to
-       LEFT JOIN users c ON c.id = l.created_by
-       LEFT JOIN products p ON p.id = l.product_id
-       ${clause}
-       ORDER BY l.updated_at DESC`,
-      params
-    );
-
-    return res.json(rows);
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ message: 'Failed to fetch leads' });
   }
-});
+  return [];
+};
 
-router.get('/stats', async (req, res) => {
-  try {
-    const { search, product_id, assigned_to } = req.query;
-    const where = [];
-    const params = [];
+/* ------------------------------------------------------------------ list */
 
-    if (req.user.role === 'sales') {
-      where.push('assigned_to = ?');
-      params.push(req.user.id);
+router.get(
+  '/',
+  asyncHandler(async (req, res) => {
+    const { clause, params } = buildLeadFilters(req.query, req.user);
+    const order = SORTS[req.query.sort] || SORTS.updated;
+    const pg = parsePagination(req.query);
+
+    if (pg.paginate) {
+      const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total FROM leads l ${clause}`, params);
+      const [rows] = await pool.query(`${LEAD_SELECT} ${clause} ORDER BY ${order} LIMIT ? OFFSET ?`, [
+        ...params,
+        pg.limit,
+        pg.offset,
+      ]);
+      return res.json(pageResult(rows.map(hydrateLead), total, pg));
     }
 
-    if (product_id) {
-      where.push('product_id = ?');
-      params.push(product_id);
-    }
+    const [rows] = await pool.query(`${LEAD_SELECT} ${clause} ORDER BY ${order} LIMIT 5000`, params);
+    return res.json(rows.map(hydrateLead));
+  })
+);
 
-    if (assigned_to === 'unassigned') {
-      where.push('assigned_to IS NULL');
-    } else if (assigned_to && req.user.role !== 'sales') {
-      where.push('assigned_to = ?');
-      params.push(assigned_to);
-    }
-
-    if (search) {
-      where.push(
-        '(name LIKE ? OR email LIKE ? OR phone LIKE ? OR company LIKE ? OR id LIKE ? OR address LIKE ?)'
-      );
-      const like = `%${search}%`;
-      params.push(like, like, like, like, like, like);
-    }
-
-    const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-
-    const [rows] = await pool.query(
+router.get(
+  '/stats',
+  asyncHandler(async (req, res) => {
+    const { clause, params } = buildLeadFilters(req.query, req.user, { ignore: ['status'] });
+    const s = scoreSql('l');
+    const [[row]] = await pool.query(
       `SELECT
          COUNT(*) AS total,
-         SUM(status = 'new') AS new_count,
-         SUM(status = 'contacted') AS contacted_count,
-         SUM(status IN ('qualified','proposal','negotiation')) AS in_progress_count,
-         SUM(status = 'won') AS won_count,
-         SUM(status = 'lost') AS lost_count,
-         SUM(assigned_to IS NULL) AS unassigned_count
-       FROM leads
-       ${clause}`,
+         SUM(l.status = 'new') AS new_count,
+         SUM(l.status = 'contacted') AS contacted_count,
+         SUM(l.status IN ('qualified','proposal','negotiation')) AS in_progress_count,
+         SUM(l.status = 'won') AS won_count,
+         SUM(l.status = 'lost') AS lost_count,
+         SUM(l.status = 'not_interested') AS not_interested_count,
+         SUM(l.assigned_to IS NULL) AS unassigned_count,
+         SUM(l.status IN ('new','contacted','qualified','proposal','negotiation') AND ${s} >= 60) AS hot_count,
+         COALESCE(SUM(CASE WHEN l.status IN ('new','contacted','qualified','proposal','negotiation') THEN l.deal_value END), 0) AS open_value,
+         COALESCE(SUM(CASE WHEN l.status = 'won' THEN l.deal_value END), 0) AS won_value,
+         SUM(EXISTS (SELECT 1 FROM reminders r WHERE r.lead_id = l.id AND r.is_completed = 0 AND r.remind_at < NOW())) AS overdue_callbacks
+       FROM leads l ${clause}`,
       params
     );
+    const out = {};
+    for (const [k, v] of Object.entries(row || {})) out[k] = Number(v) || 0;
+    return res.json(out);
+  })
+);
 
-    return res.json(rows[0] || {});
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ message: 'Failed to fetch lead stats' });
-  }
-});
+router.get(
+  '/sources',
+  asyncHandler(async (req, res) => {
+    const configured = await settings.get('lead_sources');
+    const [rows] = await pool.query(
+      `SELECT source, COUNT(*) AS total FROM leads WHERE source IS NOT NULL AND source <> '' GROUP BY source ORDER BY total DESC`
+    );
+    const names = [...new Set([...configured, ...rows.map((r) => r.source)])];
+    const counts = Object.fromEntries(rows.map((r) => [r.source, Number(r.total)]));
+    return res.json(names.map((name) => ({ name, total: counts[name] || 0 })));
+  })
+);
+
+/* -------------------------------------------------------------- pipeline */
+
+router.get(
+  '/pipeline',
+  asyncHandler(async (req, res) => {
+    const { clause, params } = buildLeadFilters(req.query, req.user, { ignore: ['status'] });
+    const perStage = Math.min(200, Math.max(10, Number(req.query.limit_per_stage) || 50));
+    const order = SORTS[req.query.sort] || 'score DESC, l.updated_at DESC';
+
+    const [agg] = await pool.query(
+      `SELECT l.status, COUNT(*) AS count, COALESCE(SUM(l.deal_value), 0) AS value
+       FROM leads l ${clause} GROUP BY l.status`,
+      params
+    );
+    const byStatus = Object.fromEntries(agg.map((r) => [r.status, r]));
+    const and = clause ? `${clause} AND` : 'WHERE';
+
+    const stages = [];
+    for (const status of STATUSES) {
+      const count = Number(byStatus[status]?.count) || 0;
+      const value = Number(byStatus[status]?.value) || 0;
+      let leads = [];
+      if (count) {
+        const [rows] = await pool.query(`${LEAD_SELECT} ${and} l.status = ? ORDER BY ${order} LIMIT ?`, [
+          ...params,
+          status,
+          perStage,
+        ]);
+        leads = rows.map(hydrateLead);
+      }
+      stages.push({
+        status,
+        count,
+        value,
+        probability: STAGE_PROBABILITY[status],
+        weighted_value: Math.round(value * STAGE_PROBABILITY[status] * 100) / 100,
+        leads,
+      });
+    }
+    const open = stages.filter((s) => OPEN_STATUSES.includes(s.status));
+    return res.json({
+      stages,
+      totals: {
+        open_count: open.reduce((n, s) => n + s.count, 0),
+        open_value: open.reduce((n, s) => n + s.value, 0),
+        weighted_value: open.reduce((n, s) => n + s.weighted_value, 0),
+      },
+    });
+  })
+);
+
+/* ---------------------------------------------------------------- export */
+
+router.get(
+  '/export',
+  asyncHandler(async (req, res) => {
+    const format = req.query.format === 'csv' ? 'csv' : 'xlsx';
+    const { clause, params } = buildLeadFilters(req.query, req.user);
+    const order = SORTS[req.query.sort] || SORTS.updated;
+    const [rows] = await pool.query(`${LEAD_SELECT} ${clause} ORDER BY ${order} LIMIT 50000`, params);
+
+    const fmt = (d) => (d ? new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) : '');
+    const data = rows.map(hydrateLead).map((l) => ({
+      ID: l.id,
+      Name: l.name,
+      Phone: l.phone || '',
+      Email: l.email || '',
+      Company: l.company || '',
+      Address: l.address || '',
+      Product: l.product_name || '',
+      Status: l.status,
+      Source: l.source || '',
+      Score: l.score,
+      Temperature: l.temperature || '',
+      'Deal value': l.deal_value ?? '',
+      'Expected close': l.expected_close_date ? String(l.expected_close_date).slice(0, 10) : '',
+      'Lost reason': l.lost_reason || '',
+      'Google Maps URL': l.maps_url || '',
+      'Business Profile URL': l.business_profile_url || '',
+      'Assigned to': l.assigned_name || '',
+      Tags: l.tags.map((t) => t.name).join(', '),
+      'Next callback': fmt(l.next_callback),
+      WhatsApp: l.whatsapp_active ? 'Yes' : 'No',
+      Notes: l.notes || '',
+      Created: fmt(l.created_at),
+      Updated: fmt(l.updated_at),
+    }));
+
+    const sheet = XLSX.utils.json_to_sheet(data);
+    const stamp = new Date().toISOString().slice(0, 10);
+    await audit(req, {
+      entityType: 'lead',
+      action: 'export',
+      summary: `Exported ${data.length} lead(s) as ${format.toUpperCase()}`,
+    });
+
+    if (format === 'csv') {
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="leads-${stamp}.csv"`);
+      return res.send(`﻿${XLSX.utils.sheet_to_csv(sheet)}`);
+    }
+    const book = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(book, sheet, 'Leads');
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="leads-${stamp}.xlsx"`);
+    return res.send(XLSX.write(book, { type: 'buffer', bookType: 'xlsx' }));
+  })
+);
+
+/* ------------------------------------------------------------ duplicates */
+
+router.get(
+  '/duplicates/check',
+  asyncHandler(async (req, res) => {
+    const matches = await findDuplicates({
+      phone: req.query.phone,
+      email: req.query.email,
+      excludeId: req.query.exclude_id || null,
+    });
+    // Sales users learn that a duplicate exists, but only see details of their own leads.
+    const items = matches.map((m) =>
+      req.user.role === 'sales' && m.assigned_to !== req.user.id
+        ? { id: null, name: m.name, assigned_name: m.assigned_name, status: m.status, product_id: m.product_id, product_name: m.product_name, phone_match: m.phone_match, restricted: true }
+        : m
+    );
+    return res.json({ count: items.length, items });
+  })
+);
+
+router.get(
+  '/duplicates',
+  authorize('admin'),
+  asyncHandler(async (req, res) => {
+    const [groups] = await pool.query(
+      `SELECT phone_normalized AS match_value, COUNT(*) AS total
+       FROM leads
+       WHERE archived_at IS NULL AND phone_normalized IS NOT NULL AND CHAR_LENGTH(phone_normalized) >= 10
+       GROUP BY phone_normalized HAVING COUNT(*) > 1
+       ORDER BY total DESC, match_value ASC
+       LIMIT 200`
+    );
+    if (!groups.length) return res.json({ groups: [], total_groups: 0 });
+
+    const [rows] = await pool.query(
+      `${LEAD_SELECT} WHERE l.archived_at IS NULL AND l.phone_normalized IN (?) ORDER BY l.created_at ASC`,
+      [groups.map((g) => g.match_value)]
+    );
+    const byPhone = {};
+    for (const row of rows.map(hydrateLead)) {
+      (byPhone[row.phone_normalized] ||= []).push(row);
+    }
+    return res.json({
+      total_groups: groups.length,
+      groups: groups.map((g) => ({ match_type: 'phone', match_value: g.match_value, leads: byPhone[g.match_value] || [] })),
+    });
+  })
+);
+
+router.post(
+  '/merge',
+  authorize('admin'),
+  body('primary_id').notEmpty().withMessage('Choose the lead to keep'),
+  body('duplicate_ids').isArray({ min: 1 }).withMessage('Choose at least one duplicate'),
+  validate,
+  asyncHandler(async (req, res) => {
+    const primaryId = String(req.body.primary_id);
+    const dupIds = [...new Set(req.body.duplicate_ids.map(String))].filter((id) => id !== primaryId);
+    if (!dupIds.length) throw badRequest('Choose at least one duplicate other than the primary lead');
+
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const [leads] = await conn.query('SELECT * FROM leads WHERE id IN (?) FOR UPDATE', [[primaryId, ...dupIds]]);
+      const primary = leads.find((l) => l.id === primaryId);
+      const dups = leads.filter((l) => dupIds.includes(l.id));
+      if (!primary) throw badRequest('Primary lead not found');
+      if (dups.length !== dupIds.length) throw badRequest('One or more duplicate leads were not found');
+      if (primary.archived_at || dups.some((d) => d.archived_at)) throw badRequest('Archived leads cannot be merged');
+
+      // Fill gaps on the primary from duplicates — never overwrite existing values.
+      const fillable = ['email', 'phone', 'company', 'address', 'website', 'category', 'deal_value', 'expected_close_date', 'assigned_to', 'product_id'];
+      const updates = {};
+      for (const field of fillable) {
+        if (primary[field] === null || primary[field] === '') {
+          const donor = dups.find((d) => d[field] !== null && d[field] !== '');
+          if (donor) updates[field] = donor[field];
+        }
+      }
+      const extraNotes = dups.filter((d) => d.notes).map((d) => `[Merged from ${d.name} (${d.id})]\n${d.notes}`);
+      if (extraNotes.length) updates.notes = [primary.notes, ...extraNotes].filter(Boolean).join('\n\n');
+      if (updates.phone) updates.phone_normalized = normalizePhone(updates.phone);
+      if (dups.some((d) => d.whatsapp_active) && !primary.whatsapp_active) updates.whatsapp_active = 1;
+
+      if (Object.keys(updates).length) {
+        await conn.query('UPDATE leads SET ? WHERE id = ?', [updates, primaryId]);
+      }
+
+      for (const table of ['reminders', 'appointments', 'communications', 'lead_status_history']) {
+        await conn.query(`UPDATE ${table} SET lead_id = ? WHERE lead_id IN (?)`, [primaryId, dupIds]);
+      }
+      await conn.query(
+        `INSERT IGNORE INTO lead_tags (lead_id, tag_id) SELECT ?, tag_id FROM lead_tags WHERE lead_id IN (?)`,
+        [primaryId, dupIds]
+      );
+      await conn.query(
+        'UPDATE leads SET archived_at = NOW(), archived_by = ?, merged_into = ? WHERE id IN (?)',
+        [req.user.id, primaryId, dupIds]
+      );
+      await conn.query(
+        `INSERT INTO communications (lead_id, user_id, type, direction, subject, content, occurred_at)
+         VALUES (?, ?, 'note', 'outbound', ?, ?, NOW())`,
+        [
+          primaryId,
+          req.user.id,
+          `Merged ${dups.length} duplicate lead(s)`,
+          dups.map((d) => `• ${d.name} — ${d.phone || d.email || d.id}`).join('\n'),
+        ]
+      );
+      await conn.query('UPDATE leads SET last_activity_at = NOW() WHERE id = ?', [primaryId]);
+      await audit(
+        req,
+        {
+          entityType: 'lead',
+          entityId: primaryId,
+          action: 'merge',
+          summary: `Merged ${dups.length} duplicate(s) into ${primary.name}`,
+          changes: { merged_ids: [null, dupIds], ...diff(primary, { ...primary, ...updates }) },
+        },
+        conn
+      );
+      await conn.commit();
+      return res.json({ message: `Merged ${dups.length} lead(s) into ${primary.name}`, primary_id: primaryId });
+    } catch (err) {
+      await conn.rollback().catch(() => {});
+      throw err;
+    } finally {
+      conn.release();
+    }
+  })
+);
+
+/** 409 for the "one lead per mobile number per product" rule. */
+function phoneProductConflict(req, lead) {
+  const visible = req.user.role === 'admin' || lead.assigned_to === req.user.id;
+  return conflict(
+    `This mobile number already has a lead for ${lead.product_name || 'this product'}${
+      lead.assigned_name ? ` (assigned to ${lead.assigned_name})` : ''
+    }`,
+    {
+      code: 'DUPLICATE_PHONE_PRODUCT',
+      existing: visible ? lead : { name: lead.name, assigned_name: lead.assigned_name, status: lead.status, restricted: true },
+    }
+  );
+}
+
+/* ---------------------------------------------------------------- create */
 
 router.post(
   '/',
@@ -250,366 +420,410 @@ router.post(
   body('name').trim().notEmpty().withMessage('Name is required'),
   body('product_id').notEmpty().withMessage('Product is required'),
   body('status').optional().isIn(STATUSES),
-  body('phone').optional({ checkFalsy: true }).trim(),
-  body('email').optional({ checkFalsy: true }).isEmail(),
-  async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
+  body('email').optional({ checkFalsy: true }).isEmail().withMessage('Enter a valid email'),
+  validate,
+  asyncHandler(async (req, res) => {
+    const { name, phone, email, company, address, website, notes, product_id, assigned_to, source } = req.body;
+    const status = req.body.status || 'new';
+    const dealValue = parseMoney(req.body.deal_value) ?? null;
+    const closeDate = parseDate(req.body.expected_close_date) ?? null;
+    const productId = await assertProduct(product_id);
+
+    // Hard rule: "Create anyway" cannot override a same-number, same-product lead.
+    const sameProduct = await findPhoneProductLead({ phone, productId });
+    if (sameProduct) throw phoneProductConflict(req, sameProduct);
+
+    if (!toBool(req.body.force)) {
+      const duplicates = await findDuplicates({ phone, email });
+      if (duplicates.length) {
+        throw conflict('A lead with this phone or email already exists', {
+          code: 'DUPLICATE_LEAD',
+          duplicates: duplicates.map((d) =>
+            req.user.role === 'sales' && d.assigned_to !== req.user.id
+              ? { name: d.name, assigned_name: d.assigned_name, status: d.status, restricted: true }
+              : d
+          ),
+        });
+      }
     }
 
-    const {
-      name,
-      phone = null,
-      email = null,
-      address = null,
-      website = null,
-      notes = null,
-      product_id,
-      assigned_to,
-      status = 'new',
-    } = req.body;
-
-    try {
-      const productId = Number(product_id);
-      const [product] = await pool.query(
-        'SELECT id FROM products WHERE id = ? LIMIT 1',
-        [productId]
-      );
-      if (!productId || !product.length) {
-        return res.status(400).json({ message: 'Select a valid product' });
-      }
-
-      let assignee = null;
-      if (req.user.role === 'sales') {
-        assignee = req.user.id;
-      } else if (assigned_to !== '' && assigned_to != null) {
-        assignee = Number(assigned_to);
-        const [salesUser] = await pool.query(
-          `SELECT id FROM users WHERE id = ? AND role = 'sales' AND status = 'active' LIMIT 1`,
-          [assignee]
-        );
-        if (!salesUser.length) {
-          return res.status(400).json({ message: 'Leads can only be assigned to sales users' });
-        }
-      }
-
-      let leadId;
-      for (let attempt = 0; attempt < 5; attempt += 1) {
-        leadId = `manual_${crypto.randomBytes(10).toString('hex')}`;
-        const [exists] = await pool.query('SELECT id FROM leads WHERE id = ? LIMIT 1', [
-          leadId,
-        ]);
-        if (!exists.length) break;
-        leadId = null;
-      }
-      if (!leadId) {
-        return res.status(500).json({ message: 'Failed to generate lead id' });
-      }
-
-      await pool.query(
-        `INSERT INTO leads (
-           id, product_id, name, email, phone, address, website,
-           source, status, assigned_to, notes, created_by, whatsapp_active
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, 0)`,
-        [
-          leadId,
-          productId,
-          name.trim(),
-          email || null,
-          phone || null,
-          address || null,
-          website || null,
-          status || 'new',
-          assignee,
-          notes || null,
-          req.user.id,
-        ]
-      );
-
-      return res.status(201).json({ id: leadId, message: 'Lead created' });
-    } catch (err) {
-      console.error(err);
-      if (err.code === 'ER_DUP_ENTRY') {
-        return res.status(409).json({ message: 'Lead id already exists, try again' });
-      }
-      return res.status(500).json({ message: 'Failed to create lead' });
+    let assignee = null;
+    if (req.user.role === 'sales') {
+      assignee = req.user.id;
+    } else if (assigned_to !== '' && assigned_to != null) {
+      assignee = Number(assigned_to);
+      await assertSalesUser(assignee);
+    } else {
+      [assignee] = await nextAssignees(1);
     }
-  }
+
+    const leadId = `manual_${crypto.randomBytes(10).toString('hex')}`;
+    await pool.query(
+      `INSERT INTO leads (
+         id, product_id, name, email, phone, phone_normalized, company, address, website,
+         source, status, deal_value, expected_close_date, assigned_to, notes, created_by,
+         whatsapp_active, stage_changed_at, last_activity_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+      [
+        leadId,
+        productId,
+        name.trim(),
+        emptyToNull(email),
+        emptyToNull(phone),
+        normalizePhone(phone),
+        emptyToNull(company),
+        emptyToNull(address),
+        emptyToNull(website),
+        emptyToNull(source) || 'manual',
+        status,
+        dealValue,
+        closeDate,
+        assignee,
+        emptyToNull(notes),
+        req.user.id,
+        toBool(req.body.whatsapp_active) ? 1 : 0,
+      ]
+    );
+    if (Array.isArray(req.body.tag_ids)) await setLeadTags(leadId, req.body.tag_ids);
+    await audit(req, { entityType: 'lead', entityId: leadId, action: 'create', summary: `Created lead ${name.trim()}` });
+
+    return res.status(201).json({ id: leadId, assigned_to: assignee, message: 'Lead created' });
+  })
 );
+
+/* ---------------------------------------------------------------- import */
 
 router.post(
   '/import',
   authorize('admin', 'sales'),
   upload.single('file'),
-  async (req, res) => {
-    try {
-      if (!req.file) {
-        return res.status(400).json({ message: 'Excel or CSV file is required' });
-      }
-
-      const originalName = String(req.file.originalname || '').toLowerCase();
-      const allowedExt = ['.xlsx', '.xls', '.csv'];
-      if (!allowedExt.some((ext) => originalName.endsWith(ext))) {
-        return res
-          .status(400)
-          .json({ message: 'Only .xlsx, .xls, or .csv files are supported' });
-      }
-
-      const rawProductIds = req.body.product_ids || req.body.product_id;
-      let productIds = [];
-      if (Array.isArray(rawProductIds)) {
-        productIds = rawProductIds;
-      } else if (typeof rawProductIds === 'string') {
-        try {
-          const parsed = JSON.parse(rawProductIds);
-          productIds = Array.isArray(parsed) ? parsed : [rawProductIds];
-        } catch {
-          productIds = rawProductIds.split(',').map((v) => v.trim());
-        }
-      }
-
-      productIds = [...new Set(productIds.map((id) => Number(id)).filter(Boolean))];
-      if (!productIds.length) {
-        return res.status(400).json({ message: 'At least one product is required for import' });
-      }
-
-      const [products] = await pool.query(
-        `SELECT id FROM products WHERE id IN (?) AND status = 'active'`,
-        [productIds]
-      );
-      if (products.length !== productIds.length) {
-        return res.status(400).json({ message: 'Select valid active products' });
-      }
-
-      const workbook = XLSX.read(req.file.buffer, {
-        type: 'buffer',
-        raw: false,
-      });
-      const sheetName = workbook.SheetNames[0];
-      if (!sheetName) {
-        return res.status(400).json({ message: 'File has no readable sheet or data' });
-      }
-      const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], {
-        defval: '',
-      });
-
-      if (!rows.length) {
-        return res.status(400).json({ message: 'File has no rows' });
-      }
-
-      let imported = 0;
-      let skipped = 0;
-      let duplicates = 0;
-      const multi = productIds.length > 1;
-
-      for (const productId of productIds) {
-        for (const row of rows) {
-          const sourceId = cleanText(row.ID || row.Id || row.id);
-          const name = cleanText(row.Name || row.name);
-          if (!sourceId || !name) {
-            skipped += 1;
-            continue;
-          }
-
-          const id = multi ? `${sourceId}::${productId}` : sourceId;
-
-          const [existing] = await pool.query(
-            'SELECT id FROM leads WHERE id = ? LIMIT 1',
-            [id]
-          );
-
-          if (existing.length) {
-            duplicates += 1;
-            continue;
-          }
-
-          await pool.query(
-            `INSERT INTO leads (
-              id, product_id, name, email, phone, company, address, website, category,
-              open_hours, rating, rating_info, latitude, longitude, maps_url,
-              featured_image, social_medias, facebook, instagram, twitter,
-              source, status, assigned_to, created_by
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-              id,
-              productId,
-              name,
-              pickFirstEmail(row.Emails || row.Email || row.emails),
-              cleanText(row.Phone || row.phone),
-              null,
-              cleanText(row.Address || row.address),
-              cleanText(row.Website || row.website),
-              cleanText(row.Category || row.category),
-              cleanText(row['Open Hours'] || row.open_hours),
-              cleanText(row.Rating || row.rating),
-              cleanText(row['Rating Info'] || row.rating_info),
-              row.Latitude || row.latitude || null,
-              row.Longitude || row.longitude || null,
-              cleanText(row['Bing Maps URL'] || row.maps_url),
-              cleanText(row['Featured image'] || row.featured_image),
-              cleanText(row['Social Medias'] || row.social_medias),
-              cleanText(row.Facebook || row.facebook),
-              cleanText(row.Instagram || row.instagram),
-              cleanText(row.Twitter || row.twitter),
-              'maps-import',
-              'new',
-              req.user.role === 'sales' ? req.user.id : null,
-              req.user.id,
-            ]
-          );
-          imported += 1;
-        }
-      }
-
-      return res.json({
-        message: 'Import completed',
-        imported,
-        duplicates,
-        skipped,
-        total: rows.length * productIds.length,
-        products: productIds.length,
-      });
-    } catch (err) {
-      console.error(err);
-      return res.status(500).json({ message: 'Failed to import leads' });
+  asyncHandler(async (req, res) => {
+    if (!req.file) throw badRequest('Excel or CSV file is required');
+    const originalName = String(req.file.originalname || '').toLowerCase();
+    if (!['.xlsx', '.xls', '.csv'].some((ext) => originalName.endsWith(ext))) {
+      throw badRequest('Only .xlsx, .xls, or .csv files are supported');
     }
-  }
+
+    const productIds = [
+      ...new Set(parseIds(req.body.product_ids || req.body.product_id).map(Number).filter(Boolean)),
+    ];
+    if (!productIds.length) throw badRequest('At least one product is required for import');
+    const [products] = await pool.query(`SELECT id FROM products WHERE id IN (?) AND status = 'active'`, [productIds]);
+    if (products.length !== productIds.length) throw badRequest('Select valid active products');
+
+    const autoAssign = req.user.role === 'admin' && toBool(req.body.auto_assign);
+    const source = cleanText(req.body.source) || 'maps-import';
+    const tagIds = parseIds(req.body.tag_ids).map(Number).filter(Boolean);
+
+    const workbook = XLSX.read(req.file.buffer, { type: 'buffer', raw: false });
+    const sheetName = workbook.SheetNames[0];
+    if (!sheetName) throw badRequest('File has no readable sheet or data');
+    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: '' });
+    if (!rows.length) throw badRequest('File has no rows');
+
+    const multi = productIds.length > 1;
+    const candidates = [];
+    let skipped = 0;
+    for (const productId of productIds) {
+      for (const row of rows) {
+        const sourceId = cleanText(row.ID || row.Id || row.id);
+        const name = cleanText(row.Name || row.name);
+        if (!name) {
+          skipped += 1;
+          continue;
+        }
+        // Rows without an ID get a stable id derived from their content.
+        const baseId =
+          sourceId ||
+          `imp_${crypto
+            .createHash('sha1')
+            .update(`${name}|${row.Phone || row.phone || ''}|${row.Address || row.address || ''}`)
+            .digest('hex')
+            .slice(0, 20)}`;
+        const phone = cleanText(row.Phone || row.phone || row.Mobile || row.mobile);
+        candidates.push({
+          id: multi ? `${baseId}::${productId}` : baseId,
+          productId,
+          name,
+          phone,
+          row,
+        });
+      }
+    }
+
+    // Existing ids (one query per 500) instead of one query per row.
+    const existingIds = new Set();
+    for (let i = 0; i < candidates.length; i += 500) {
+      const chunk = candidates.slice(i, i + 500).map((c) => c.id);
+      const [found] = await pool.query('SELECT id FROM leads WHERE id IN (?)', [chunk]);
+      found.forEach((f) => existingIds.add(f.id));
+    }
+    // One lead per mobile number per product, always (skip_phone_duplicates is ignored).
+    const existingPhones = new Set();
+    const phones = [...new Set(candidates.map((c) => normalizePhone(c.phone)).filter((p) => p && p.length >= 10))];
+    for (let i = 0; i < phones.length; i += 500) {
+      const [found] = await pool.query(
+        `SELECT DISTINCT phone_normalized, product_id FROM leads WHERE archived_at IS NULL AND phone_normalized IN (?)`,
+        [phones.slice(i, i + 500)]
+      );
+      found.forEach((f) => existingPhones.add(`${f.phone_normalized}|${f.product_id}`));
+    }
+
+    let duplicates = 0;
+    let phoneDuplicates = 0;
+    const seen = new Set();
+    const toInsert = [];
+    const linkBackfills = [];
+    for (const c of candidates) {
+      if (existingIds.has(c.id) || seen.has(c.id)) {
+        duplicates += 1;
+        const businessProfileUrl = cleanText(c.row['Business Profile URL'] || c.row.business_profile_url);
+        const mapsUrl = cleanText(c.row['Google Maps URL'] || c.row['Bing Maps URL'] || c.row.maps_url);
+        if (existingIds.has(c.id) && (businessProfileUrl || mapsUrl)) {
+          linkBackfills.push({ id: c.id, businessProfileUrl, mapsUrl });
+        }
+        continue;
+      }
+      const phoneKey = `${normalizePhone(c.phone)}|${c.productId}`;
+      if (normalizePhone(c.phone)?.length >= 10 && existingPhones.has(phoneKey)) {
+        phoneDuplicates += 1;
+        continue;
+      }
+      seen.add(c.id);
+      if (normalizePhone(c.phone)?.length >= 10) existingPhones.add(phoneKey);
+      toInsert.push(c);
+    }
+
+    const assignees = autoAssign
+      ? await nextAssignees(toInsert.length, { force: true })
+      : toInsert.map(() => (req.user.role === 'sales' ? req.user.id : null));
+
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      for (let i = 0; i < toInsert.length; i += 200) {
+        const values = toInsert.slice(i, i + 200).map((c, j) => {
+          const r = c.row;
+          return [
+            c.id,
+            c.productId,
+            c.name,
+            pickFirstEmail(r.Emails || r.Email || r.emails || r.email),
+            c.phone,
+            normalizePhone(c.phone),
+            cleanText(r.Company || r.company),
+            cleanText(r.Address || r.address),
+            cleanText(r.Website || r.website),
+            cleanText(r.Category || r.category),
+            cleanText(r['Open Hours'] || r.open_hours),
+            cleanText(r.Rating || r.rating),
+            cleanText(r['Rating Info'] || r.rating_info),
+            r.Latitude || r.latitude || null,
+            r.Longitude || r.longitude || null,
+            cleanText(r['Google Maps URL'] || r['Bing Maps URL'] || r.maps_url),
+            cleanText(r['Business Profile URL'] || r.business_profile_url),
+            cleanText(r['Featured image'] || r.featured_image),
+            cleanText(r['Social Medias'] || r.social_medias),
+            cleanText(r.Facebook || r.facebook),
+            cleanText(r.Instagram || r.instagram),
+            cleanText(r.Twitter || r.twitter),
+            source,
+            'new',
+            assignees[i + j],
+            req.user.id,
+            new Date(),
+          ];
+        });
+        await conn.query(
+          `INSERT INTO leads (
+             id, product_id, name, email, phone, phone_normalized, company, address, website, category,
+             open_hours, rating, rating_info, latitude, longitude, maps_url, business_profile_url,
+             featured_image, social_medias, facebook, instagram, twitter,
+             source, status, assigned_to, created_by, stage_changed_at
+           ) VALUES ?`,
+          [values]
+        );
+        if (tagIds.length) {
+          const [validTags] = await conn.query('SELECT id FROM tags WHERE id IN (?)', [tagIds]);
+          const pairs = [];
+          for (const c of toInsert.slice(i, i + 200)) for (const t of validTags) pairs.push([c.id, t.id]);
+          if (pairs.length) await conn.query('INSERT IGNORE INTO lead_tags (lead_id, tag_id) VALUES ?', [pairs]);
+        }
+      }
+      await conn.commit();
+    } catch (err) {
+      await conn.rollback().catch(() => {});
+      throw err;
+    } finally {
+      conn.release();
+    }
+
+    // Leads imported earlier (same source ID) get their Google links filled in,
+    // but only where the field is still empty — existing values are never overwritten.
+    let linksBackfilled = 0;
+    for (const b of linkBackfills) {
+      const [result] = await pool.query(
+        `UPDATE leads
+         SET business_profile_url = COALESCE(NULLIF(business_profile_url, ''), ?),
+             maps_url = COALESCE(NULLIF(maps_url, ''), ?),
+             updated_at = updated_at
+         WHERE id = ?
+           AND ((business_profile_url IS NULL OR business_profile_url = '') AND ? IS NOT NULL
+             OR (maps_url IS NULL OR maps_url = '') AND ? IS NOT NULL)`,
+        [b.businessProfileUrl, b.mapsUrl, b.id, b.businessProfileUrl, b.mapsUrl]
+      );
+      linksBackfilled += result.affectedRows;
+    }
+
+    await audit(req, {
+      entityType: 'lead',
+      action: 'import',
+      summary: `Imported ${toInsert.length} lead(s) from ${req.file.originalname}${
+        linksBackfilled ? `; added Google links to ${linksBackfilled} existing lead(s)` : ''
+      }`,
+    });
+
+    return res.json({
+      message: 'Import completed',
+      imported: toInsert.length,
+      duplicates,
+      phone_duplicates: phoneDuplicates,
+      skipped,
+      total: rows.length * productIds.length,
+      products: productIds.length,
+      auto_assigned: autoAssign ? toInsert.length : 0,
+      links_backfilled: linksBackfilled,
+    });
+  })
 );
+
+/* ------------------------------------------------------------------ bulk */
 
 router.post(
   '/bulk',
   authorize('admin', 'sales'),
   body('ids').isArray({ min: 1 }),
-  body('action').isIn(['assign', 'status', 'delete', 'whatsapp']),
-  async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
+  body('action').isIn(['assign', 'auto_assign', 'status', 'delete', 'archive', 'restore', 'whatsapp', 'tag_add', 'tag_remove']),
+  validate,
+  asyncHandler(async (req, res) => {
+    const { action } = req.body;
+    const ids = [...new Set(req.body.ids.map(String))];
+    const isAdmin = req.user.role === 'admin';
+    const adminOnly = ['assign', 'auto_assign', 'delete', 'archive', 'restore'];
+    if (adminOnly.includes(action) && !isAdmin) throw forbidden(`Only admin can ${action.replace('_', ' ')} leads`);
+
+    // Scope to leads the user may touch.
+    const scope = ['id IN (?)'];
+    const scopeParams = [ids];
+    if (!isAdmin) {
+      scope.push('assigned_to = ?');
+      scopeParams.push(req.user.id);
+    }
+    const [current] = await pool.query(`SELECT id, name, status, assigned_to FROM leads WHERE ${scope.join(' AND ')}`, scopeParams);
+    const allowed = current.map((r) => r.id);
+    if (!allowed.length) throw badRequest('None of the selected leads can be updated');
+    const n = allowed.length;
+
+    if (action === 'delete' || action === 'archive') {
+      await pool.query('UPDATE leads SET archived_at = NOW(), archived_by = ? WHERE id IN (?) AND archived_at IS NULL', [
+        req.user.id,
+        allowed,
+      ]);
+      await audit(req, { entityType: 'lead', action: 'archive', summary: `Archived ${n} lead(s)`, changes: { ids: [null, allowed] } });
+      return res.json({ message: `${n} lead(s) archived` });
     }
 
-    const { ids, action, assigned_to, status, note, whatsapp_active } = req.body;
-
-    try {
-      if (action === 'delete') {
-        if (req.user.role !== 'admin') {
-          return res.status(403).json({ message: 'Only admin can delete leads' });
-        }
-        for (const id of ids) {
-          await assertLeadDeletable(id);
-        }
-        await pool.query(`DELETE FROM leads WHERE id IN (?)`, [ids]);
-        return res.json({ message: `${ids.length} lead(s) deleted` });
+    if (action === 'restore') {
+      // Skip any lead whose number already has an active lead for the same product.
+      const [rows] = await pool.query('SELECT id, phone, product_id FROM leads WHERE id IN (?)', [allowed]);
+      const taken = new Set();
+      const restorable = [];
+      for (const row of rows) {
+        const key = `${normalizePhone(row.phone)}|${row.product_id}`;
+        const checkable = normalizePhone(row.phone)?.length >= 10;
+        if (checkable && (taken.has(key) || (await findPhoneProductLead({ phone: row.phone, productId: row.product_id, excludeId: row.id })))) continue;
+        if (checkable) taken.add(key);
+        restorable.push(row.id);
       }
-
-      if (action === 'assign') {
-        if (req.user.role !== 'admin') {
-          return res.status(403).json({ message: 'Only admin can assign leads' });
-        }
-        const assignee =
-          assigned_to === '' || assigned_to === null ? null : Number(assigned_to);
-        if (assignee) {
-          const [salesUser] = await pool.query(
-            `SELECT id FROM users WHERE id = ? AND role = 'sales' AND status = 'active' LIMIT 1`,
-            [assignee]
-          );
-          if (!salesUser.length) {
-            return res.status(400).json({ message: 'Leads can only be assigned to sales users' });
-          }
-        }
-        await pool.query(`UPDATE leads SET assigned_to = ? WHERE id IN (?)`, [
-          assignee,
-          ids,
-        ]);
-        return res.json({ message: `${ids.length} lead(s) assigned` });
+      const blocked = rows.length - restorable.length;
+      if (restorable.length) {
+        await pool.query('UPDATE leads SET archived_at = NULL, archived_by = NULL, merged_into = NULL WHERE id IN (?)', [restorable]);
+        await audit(req, { entityType: 'lead', action: 'restore', summary: `Restored ${restorable.length} lead(s)`, changes: { ids: [null, restorable] } });
       }
-
-      if (action === 'status') {
-        if (!STATUSES.includes(status)) {
-          return res.status(400).json({ message: 'Invalid status' });
-        }
-
-        const where = ['id IN (?)'];
-        const params = [ids];
-        if (req.user.role === 'sales') {
-          where.push('assigned_to = ?');
-          params.push(req.user.id);
-        }
-
-        const [current] = await pool.query(
-          `SELECT id, status FROM leads WHERE ${where.join(' AND ')}`,
-          params
-        );
-
-        if (req.user.role === 'sales') {
-          await pool.query(
-            `UPDATE leads SET status = ? WHERE id IN (?) AND assigned_to = ?`,
-            [status, ids, req.user.id]
-          );
-        } else {
-          await pool.query(`UPDATE leads SET status = ? WHERE id IN (?)`, [status, ids]);
-        }
-
-        for (const row of current) {
-          await logStatusChange(pool, {
-            leadId: row.id,
-            fromStatus: row.status,
-            toStatus: status,
-            changedBy: req.user.id,
-            note,
-          });
-        }
-
-        return res.json({ message: `${ids.length} lead(s) updated` });
-      }
-
-      if (action === 'whatsapp') {
-        const active =
-          whatsapp_active === true ||
-          whatsapp_active === 1 ||
-          whatsapp_active === '1' ||
-          whatsapp_active === 'true';
-        const value = active ? 1 : 0;
-
-        const where = ['id IN (?)'];
-        const params = [ids];
-        if (req.user.role === 'sales') {
-          where.push('assigned_to = ?');
-          params.push(req.user.id);
-        }
-
-        await pool.query(
-          `UPDATE leads SET whatsapp_active = ? WHERE ${where.join(' AND ')}`,
-          [value, ...params]
-        );
-
-        return res.json({
-          message: `${ids.length} lead(s) marked WhatsApp ${active ? 'active' : 'inactive'}`,
-        });
-      }
-
-      return res.status(400).json({ message: 'Invalid action' });
-    } catch (err) {
-      console.error(err);
-      return res
-        .status(err.status || 500)
-        .json({ message: err.message || 'Bulk action failed' });
+      return res.json({
+        message: `${restorable.length} lead(s) restored${blocked ? `, ${blocked} skipped (same number already active for that product)` : ''}`,
+        restored: restorable.length,
+        skipped: blocked,
+      });
     }
-  }
+
+    if (action === 'assign') {
+      const assignee = req.body.assigned_to === '' || req.body.assigned_to == null ? null : Number(req.body.assigned_to);
+      if (assignee) await assertSalesUser(assignee);
+      await pool.query('UPDATE leads SET assigned_to = ? WHERE id IN (?)', [assignee, allowed]);
+      await audit(req, {
+        entityType: 'lead',
+        action: 'assign',
+        summary: `Assigned ${n} lead(s) to user #${assignee || 'none'}`,
+        changes: { assigned_to: [null, assignee], ids: [null, allowed] },
+      });
+      return res.json({ message: `${n} lead(s) assigned` });
+    }
+
+    if (action === 'auto_assign') {
+      const assignees = await nextAssignees(n, { force: true });
+      if (!assignees[0]) throw badRequest('No active sales users are enabled for auto-assignment');
+      for (let i = 0; i < n; i += 1) {
+        await pool.query('UPDATE leads SET assigned_to = ? WHERE id = ?', [assignees[i], allowed[i]]);
+      }
+      await audit(req, { entityType: 'lead', action: 'assign', summary: `Auto-assigned ${n} lead(s) round-robin` });
+      return res.json({ message: `${n} lead(s) distributed across ${new Set(assignees).size} user(s)` });
+    }
+
+    if (action === 'status') {
+      const { status, note } = req.body;
+      if (!STATUSES.includes(status)) throw badRequest('Invalid status');
+      const lostReason = status === 'lost' ? emptyToNull(req.body.lost_reason) : undefined;
+      await pool.query(
+        `UPDATE leads SET status = ?${lostReason !== undefined ? ', lost_reason = ?' : ''} WHERE id IN (?)`,
+        lostReason !== undefined ? [status, lostReason, allowed] : [status, allowed]
+      );
+      for (const row of current) {
+        await logStatusChange(pool, { leadId: row.id, fromStatus: row.status, toStatus: status, changedBy: req.user.id, note });
+      }
+      await audit(req, { entityType: 'lead', action: 'status', summary: `Moved ${n} lead(s) to ${status}` });
+      return res.json({ message: `${n} lead(s) updated` });
+    }
+
+    if (action === 'whatsapp') {
+      const active = toBool(req.body.whatsapp_active);
+      await pool.query('UPDATE leads SET whatsapp_active = ? WHERE id IN (?)', [active ? 1 : 0, allowed]);
+      return res.json({ message: `${n} lead(s) marked WhatsApp ${active ? 'active' : 'inactive'}` });
+    }
+
+    if (action === 'tag_add' || action === 'tag_remove') {
+      const tagIds = (req.body.tag_ids || []).map(Number).filter(Boolean);
+      if (!tagIds.length) throw badRequest('Choose at least one tag');
+      if (action === 'tag_add') {
+        const pairs = [];
+        for (const id of allowed) for (const t of tagIds) pairs.push([id, t]);
+        await pool.query('INSERT IGNORE INTO lead_tags (lead_id, tag_id) VALUES ?', [pairs]);
+      } else {
+        await pool.query('DELETE FROM lead_tags WHERE lead_id IN (?) AND tag_id IN (?)', [allowed, tagIds]);
+      }
+      return res.json({ message: `Tags updated on ${n} lead(s)` });
+    }
+
+    throw badRequest('Invalid action');
+  })
 );
 
-router.get('/:id/status-history', async (req, res) => {
-  try {
-    const [leadRows] = await pool.query('SELECT id, assigned_to FROM leads WHERE id = ? LIMIT 1', [
-      req.params.id,
-    ]);
-    if (!leadRows.length) {
-      return res.status(404).json({ message: 'Lead not found' });
-    }
-    if (req.user.role === 'sales' && leadRows[0].assigned_to !== req.user.id) {
-      return res.status(403).json({ message: 'Access denied' });
-    }
+/* ---------------------------------------------------------- single lead */
 
+router.get(
+  '/:id/status-history',
+  asyncHandler(async (req, res) => {
+    await getLeadForUser(req.params.id, req.user);
     const [rows] = await pool.query(
       `SELECT h.*, u.name AS changed_by_name
        FROM lead_status_history h
@@ -620,161 +834,227 @@ router.get('/:id/status-history', async (req, res) => {
       [req.params.id]
     );
     return res.json(rows);
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ message: 'Failed to fetch status history' });
-  }
-});
+  })
+);
 
-router.get('/:id', async (req, res) => {
-  try {
-    const [rows] = await pool.query(
-      `SELECT l.*,
-              u.name AS assigned_name,
-              c.name AS created_by_name,
-              p.name AS product_name
-       FROM leads l
-       LEFT JOIN users u ON u.id = l.assigned_to
-       LEFT JOIN users c ON c.id = l.created_by
-       LEFT JOIN products p ON p.id = l.product_id
-       WHERE l.id = ? LIMIT 1`,
-      [req.params.id]
+router.get(
+  '/:id/timeline',
+  asyncHandler(async (req, res) => {
+    const lead = await getLeadForUser(req.params.id, req.user);
+    const id = lead.id;
+    const [activities] = await pool.query(
+      `SELECT c.*, u.name AS user_name FROM communications c
+       LEFT JOIN users u ON u.id = c.user_id WHERE c.lead_id = ?`,
+      [id]
+    );
+    const [history] = await pool.query(
+      `SELECT h.*, u.name AS user_name FROM lead_status_history h
+       LEFT JOIN users u ON u.id = h.changed_by WHERE h.lead_id = ?`,
+      [id]
+    );
+    const [reminders] = await pool.query(
+      `SELECT r.*, u.name AS user_name FROM reminders r
+       LEFT JOIN users u ON u.id = r.user_id WHERE r.lead_id = ?`,
+      [id]
+    );
+    const [appointments] = await pool.query(
+      `SELECT a.*, u.name AS user_name FROM appointments a
+       LEFT JOIN users u ON u.id = a.user_id WHERE a.lead_id = ?`,
+      [id]
+    );
+    const [audits] = await pool.query(
+      `SELECT a.id, a.action, a.summary, a.created_at, u.name AS user_name FROM audit_logs a
+       LEFT JOIN users u ON u.id = a.user_id
+       WHERE a.entity_type = 'lead' AND a.entity_id = ? AND a.action IN ('create','assign','archive','restore','merge')`,
+      [id]
     );
 
-    if (!rows.length) {
-      return res.status(404).json({ message: 'Lead not found' });
-    }
+    const items = [
+      ...activities.map((a) => ({
+        kind: 'activity',
+        id: `a${a.id}`,
+        ref_id: a.id,
+        at: a.occurred_at || a.created_at,
+        type: a.type,
+        direction: a.direction,
+        subject: a.subject,
+        content: a.content,
+        outcome: a.outcome,
+        duration_seconds: a.duration_seconds,
+        user_id: a.user_id,
+        user_name: a.user_name,
+      })),
+      ...history.map((h) => ({
+        kind: 'status',
+        id: `s${h.id}`,
+        at: h.created_at,
+        from_status: h.from_status,
+        to_status: h.to_status,
+        note: h.note,
+        user_name: h.user_name,
+      })),
+      ...reminders.map((r) => ({
+        kind: 'reminder',
+        id: `r${r.id}`,
+        ref_id: r.id,
+        at: r.is_completed ? r.completed_at || r.updated_at : r.created_at,
+        due_at: r.remind_at,
+        title: r.title,
+        description: r.description,
+        priority: r.priority,
+        is_completed: !!r.is_completed,
+        user_name: r.user_name,
+      })),
+      ...appointments.map((a) => ({
+        kind: 'appointment',
+        id: `p${a.id}`,
+        ref_id: a.id,
+        at: a.created_at,
+        start_at: a.start_at,
+        title: a.title,
+        platform: a.platform,
+        status: a.status,
+        location: a.location,
+        user_name: a.user_name,
+      })),
+      ...audits.map((a) => ({
+        kind: 'system',
+        id: `x${a.id}`,
+        at: a.created_at,
+        action: a.action,
+        summary: a.summary,
+        user_name: a.user_name,
+      })),
+    ].sort((x, y) => new Date(y.at) - new Date(x.at));
 
-    const lead = rows[0];
-    if (req.user.role === 'sales' && lead.assigned_to !== req.user.id) {
-      return res.status(403).json({ message: 'Access denied' });
-    }
+    return res.json({ items });
+  })
+);
 
+router.get(
+  '/:id',
+  asyncHandler(async (req, res) => {
+    const lead = await getLeadForUser(req.params.id, req.user);
+    const [[counts]] = await pool.query(
+      `SELECT
+         (SELECT COUNT(*) FROM reminders WHERE lead_id = ? AND is_completed = 0) AS open_reminders,
+         (SELECT COUNT(*) FROM appointments WHERE lead_id = ?) AS appointments,
+         (SELECT COUNT(*) FROM communications WHERE lead_id = ?) AS activities`,
+      [lead.id, lead.id, lead.id]
+    );
+    lead.counts = {
+      open_reminders: Number(counts.open_reminders) || 0,
+      appointments: Number(counts.appointments) || 0,
+      activities: Number(counts.activities) || 0,
+    };
     return res.json(lead);
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ message: 'Failed to fetch lead' });
-  }
-});
+  })
+);
 
 router.put(
   '/:id',
   authorize('admin', 'sales'),
   body('status').optional().isIn(STATUSES),
-  async (req, res) => {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
+  body('email').optional({ checkFalsy: true }).isEmail().withMessage('Enter a valid email'),
+  body('name').optional().trim().notEmpty().withMessage('Name is required'),
+  validate,
+  asyncHandler(async (req, res) => {
+    const [existingRows] = await pool.query('SELECT * FROM leads WHERE id = ? LIMIT 1', [req.params.id]);
+    if (!existingRows.length) throw notFound('Lead not found');
+    const existing = existingRows[0];
+    if (req.user.role === 'sales' && existing.assigned_to !== req.user.id) throw forbidden();
+
+    const text = ['notes', 'phone', 'email', 'address', 'website', 'name', 'company', 'source', 'lost_reason', 'maps_url', 'business_profile_url'];
+    const changes = {};
+    for (const field of text) {
+      if (req.body[field] !== undefined) changes[field] = emptyToNull(typeof req.body[field] === 'string' ? req.body[field].trim() : req.body[field]);
+    }
+    if (changes.name === null) throw badRequest('Name is required');
+    if (req.body.status !== undefined) changes.status = req.body.status;
+    if (req.body.deal_value !== undefined) changes.deal_value = parseMoney(req.body.deal_value);
+    if (req.body.expected_close_date !== undefined) changes.expected_close_date = parseDate(req.body.expected_close_date);
+    // The product is fixed once a lead exists (its reminders, appointments and the
+    // phone-per-product rule all hang off it). Re-sending the same product is fine.
+    if (req.body.product_id !== undefined && req.body.product_id !== null && req.body.product_id !== '' &&
+        Number(req.body.product_id) !== Number(existing.product_id)) {
+      throw badRequest("A lead's product can't be changed after it is created");
+    }
+    if (req.body.whatsapp_active !== undefined) changes.whatsapp_active = toBool(req.body.whatsapp_active) ? 1 : 0;
+    if (changes.phone !== undefined) {
+      changes.phone_normalized = normalizePhone(changes.phone);
+      if (changes.phone_normalized !== existing.phone_normalized && !existing.archived_at) {
+        const clash = await findPhoneProductLead({ phone: changes.phone, productId: existing.product_id, excludeId: existing.id });
+        if (clash) throw phoneProductConflict(req, clash);
+      }
+    }
+    if (req.body.assigned_to !== undefined && req.user.role === 'admin') {
+      const assignee = req.body.assigned_to === '' || req.body.assigned_to === null ? null : Number(req.body.assigned_to);
+      if (assignee) await assertSalesUser(assignee);
+      changes.assigned_to = assignee;
+    }
+    // Moving out of "lost" clears the stale reason unless a new one was sent.
+    if (changes.status && changes.status !== 'lost' && existing.status === 'lost' && req.body.lost_reason === undefined) {
+      changes.lost_reason = null;
     }
 
-    try {
-      const [existing] = await pool.query('SELECT * FROM leads WHERE id = ? LIMIT 1', [
-        req.params.id,
-      ]);
-      if (!existing.length) {
-        return res.status(404).json({ message: 'Lead not found' });
-      }
+    const hasTags = Array.isArray(req.body.tag_ids);
+    if (!Object.keys(changes).length && !hasTags) throw badRequest('No fields to update');
 
-      if (req.user.role === 'sales' && existing[0].assigned_to !== req.user.id) {
-        return res.status(403).json({ message: 'Access denied' });
-      }
-
-      const previousStatus = existing[0].status;
-      const fields = [
-        'status',
-        'notes',
-        'product_id',
-        'assigned_to',
-        'phone',
-        'email',
-        'address',
-        'website',
-        'name',
-        'whatsapp_active',
-      ];
-      const updates = [];
-      const values = [];
-
-      for (const field of fields) {
-        if (req.body[field] === undefined) continue;
-        if (field === 'assigned_to') {
-          if (req.user.role !== 'admin') continue;
-          const assignee =
-            req.body.assigned_to === '' || req.body.assigned_to === null
-              ? null
-              : Number(req.body.assigned_to);
-          if (assignee) {
-            const [salesUser] = await pool.query(
-              `SELECT id FROM users WHERE id = ? AND role = 'sales' AND status = 'active' LIMIT 1`,
-              [assignee]
-            );
-            if (!salesUser.length) {
-              return res
-                .status(400)
-                .json({ message: 'Leads can only be assigned to sales users' });
-            }
-          }
-          updates.push('assigned_to = ?');
-          values.push(assignee);
-          continue;
-        }
-        if (field === 'whatsapp_active') {
-          const active =
-            req.body.whatsapp_active === true ||
-            req.body.whatsapp_active === 1 ||
-            req.body.whatsapp_active === '1' ||
-            req.body.whatsapp_active === 'true';
-          updates.push('whatsapp_active = ?');
-          values.push(active ? 1 : 0);
-          continue;
-        }
-        updates.push(`${field} = ?`);
-        values.push(req.body[field] === '' ? null : req.body[field]);
-      }
-
-      if (!updates.length) {
-        return res.status(400).json({ message: 'No fields to update' });
-      }
-
-      values.push(req.params.id);
-      await pool.query(`UPDATE leads SET ${updates.join(', ')} WHERE id = ?`, values);
-
-      if (req.body.status !== undefined) {
-        await logStatusChange(pool, {
-          leadId: req.params.id,
-          fromStatus: previousStatus,
-          toStatus: req.body.status,
-          changedBy: req.user.id,
-          note: req.body.status_note,
-        });
-      }
-
-      return res.json({ message: 'Lead updated' });
-    } catch (err) {
-      console.error(err);
-      return res.status(500).json({ message: 'Failed to update lead' });
+    if (Object.keys(changes).length) {
+      await pool.query('UPDATE leads SET ? WHERE id = ?', [changes, req.params.id]);
     }
-  }
+    if (hasTags) await setLeadTags(req.params.id, req.body.tag_ids);
+
+    if (changes.status !== undefined) {
+      await logStatusChange(pool, {
+        leadId: req.params.id,
+        fromStatus: existing.status,
+        toStatus: changes.status,
+        changedBy: req.user.id,
+        note: req.body.status_note,
+      });
+    }
+
+    const changed = diff(existing, changes);
+    if (Object.keys(changed).length || hasTags) {
+      await audit(req, {
+        entityType: 'lead',
+        entityId: req.params.id,
+        action: changed.assigned_to ? 'assign' : 'update',
+        summary: changed.assigned_to
+          ? `Reassigned ${existing.name}`
+          : `Updated ${Object.keys(changed).join(', ') || 'tags'} on ${existing.name}`,
+        changes: changed,
+      });
+    }
+
+    return res.json({ message: 'Lead updated' });
+  })
 );
 
-router.delete('/:id', authorize('admin'), async (req, res) => {
-  try {
-    const [existing] = await pool.query('SELECT id FROM leads WHERE id = ? LIMIT 1', [
-      req.params.id,
-    ]);
-    if (!existing.length) {
-      return res.status(404).json({ message: 'Lead not found' });
-    }
+router.post(
+  '/:id/restore',
+  authorize('admin'),
+  asyncHandler(async (req, res) => {
+    const lead = await getLeadForUser(req.params.id, req.user);
+    const clash = await findPhoneProductLead({ phone: lead.phone, productId: lead.product_id, excludeId: lead.id });
+    if (clash) throw phoneProductConflict(req, clash);
+    await pool.query('UPDATE leads SET archived_at = NULL, archived_by = NULL, merged_into = NULL WHERE id = ?', [lead.id]);
+    await audit(req, { entityType: 'lead', entityId: lead.id, action: 'restore', summary: `Restored ${lead.name}` });
+    return res.json({ message: 'Lead restored' });
+  })
+);
 
-    await assertLeadDeletable(req.params.id);
-    await pool.query('DELETE FROM leads WHERE id = ?', [req.params.id]);
-    return res.json({ message: 'Lead deleted' });
-  } catch (err) {
-    console.error(err);
-    return res
-      .status(err.status || 500)
-      .json({ message: err.message || 'Failed to delete lead' });
-  }
-});
+// "Delete" archives the lead so no history is ever lost; admins can restore it.
+router.delete(
+  '/:id',
+  authorize('admin'),
+  asyncHandler(async (req, res) => {
+    const lead = await getLeadForUser(req.params.id, req.user);
+    await pool.query('UPDATE leads SET archived_at = NOW(), archived_by = ? WHERE id = ?', [req.user.id, lead.id]);
+    await audit(req, { entityType: 'lead', entityId: lead.id, action: 'archive', summary: `Archived ${lead.name}` });
+    return res.json({ message: 'Lead archived' });
+  })
+);
 
 module.exports = router;

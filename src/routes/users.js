@@ -3,6 +3,7 @@ const { body, validationResult } = require('express-validator');
 const pool = require('../config/db');
 const { authenticate, authorize } = require('../middleware/auth');
 const { normalizePhone } = require('../utils/otp');
+const { audit } = require('../services/audit');
 
 const router = express.Router();
 
@@ -43,7 +44,10 @@ router.get('/', authorize('admin'), async (req, res) => {
       );
       const total = countRows[0].total || 0;
       const [rows] = await pool.query(
-        `SELECT id, name, email, role, phone, status, created_at
+        `SELECT id, name, email, role, phone, status, auto_assign, created_at,
+                (SELECT COUNT(*) FROM leads l WHERE l.assigned_to = users.id AND l.archived_at IS NULL
+                   AND l.status IN ('new','contacted','qualified','proposal','negotiation')) AS open_leads,
+                (SELECT MAX(s.last_seen_at) FROM user_sessions s WHERE s.user_id = users.id) AS last_seen_at
          FROM users
          ${clause}
          ORDER BY created_at DESC
@@ -147,13 +151,15 @@ router.post(
     }
 
     const { name, email = null, role, status = 'active' } = req.body;
+    const autoAssign = req.body.auto_assign === undefined ? 1 : req.body.auto_assign ? 1 : 0;
 
     try {
       const [result] = await pool.query(
-        `INSERT INTO users (name, email, role, phone, status)
-         VALUES (?, ?, ?, ?, ?)`,
-        [name, email || `${phone}@onelead.local`, role, phone, status]
+        `INSERT INTO users (name, email, role, phone, status, auto_assign)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [name, email || `${phone}@onelead.local`, role, phone, status, autoAssign]
       );
+      await audit(req, { entityType: 'user', entityId: result.insertId, action: 'create', summary: `Created ${role} user ${name}` });
 
       return res.status(201).json({
         id: result.insertId,
@@ -216,6 +222,10 @@ router.put(
       fields.push('status = ?');
       values.push(status);
     }
+    if (req.body.auto_assign !== undefined) {
+      fields.push('auto_assign = ?');
+      values.push(req.body.auto_assign ? 1 : 0);
+    }
 
     if (!fields.length) {
       return res.status(400).json({ message: 'No fields to update' });
@@ -225,6 +235,19 @@ router.put(
 
     try {
       await pool.query(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`, values);
+      if (status === 'inactive') {
+        // Deactivated users are signed out everywhere.
+        await pool.query('UPDATE user_sessions SET revoked_at = NOW() WHERE user_id = ? AND revoked_at IS NULL', [
+          req.params.id,
+        ]);
+      }
+      await audit(req, {
+        entityType: 'user',
+        entityId: req.params.id,
+        action: status === 'inactive' ? 'deactivate' : 'update',
+        summary: `Updated user #${req.params.id}`,
+        changes: Object.fromEntries(fields.map((f, i) => [f.split(' ')[0], [null, values[i]]])),
+      });
       return res.json({ message: 'User updated' });
     } catch (err) {
       if (err.code === 'ER_DUP_ENTRY') {

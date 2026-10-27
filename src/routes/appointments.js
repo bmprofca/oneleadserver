@@ -2,6 +2,7 @@ const express = require('express');
 const { body, validationResult } = require('express-validator');
 const pool = require('../config/db');
 const { authenticate, authorize } = require('../middleware/auth');
+const { getLeadForUser, touchActivity } = require('../services/leads');
 
 const router = express.Router();
 
@@ -87,7 +88,9 @@ router.get('/', async (req, res) => {
     const offset = (pageNum - 1) * pageSize;
 
     const selectSql = `SELECT a.*,
-              l.name AS lead_name,
+              l.name AS lead_name, l.phone AS lead_phone, l.whatsapp_active AS lead_whatsapp,
+              l.address AS lead_address, l.maps_url AS lead_maps_url, l.business_profile_url AS lead_business_profile_url,
+              l.latitude AS lead_latitude, l.longitude AS lead_longitude,
               p.name AS product_name,
               u.name AS assigned_name
        FROM appointments a
@@ -155,6 +158,7 @@ router.post(
 
     try {
       const productId = await assertProduct(product_id);
+      if (lead_id) await getLeadForUser(lead_id, req.user);
       const assignee = await resolveAssignee(
         req,
         assigned_to !== undefined ? assigned_to : user_id
@@ -177,6 +181,7 @@ router.post(
           status,
         ]
       );
+      await touchActivity(lead_id || null);
       return res.status(201).json({ id: result.insertId, message: 'Appointment created' });
     } catch (err) {
       console.error(err);
@@ -209,6 +214,8 @@ router.put('/:id', authorize('admin', 'sales'), async (req, res) => {
     if (req.body.product_id !== undefined && !req.body.product_id) {
       return res.status(400).json({ message: 'Product is required' });
     }
+
+    if (req.body.lead_id) await getLeadForUser(req.body.lead_id, req.user);
 
     const fields = [
       'title',
@@ -249,6 +256,9 @@ router.put('/:id', authorize('admin', 'sales'), async (req, res) => {
 
     values.push(req.params.id);
     await pool.query(`UPDATE appointments SET ${updates.join(', ')} WHERE id = ?`, values);
+    if (req.body.status && req.body.status !== existing[0].status) {
+      await touchActivity(req.body.lead_id || existing[0].lead_id);
+    }
     return res.json({ message: 'Appointment updated' });
   } catch (err) {
     console.error(err);
