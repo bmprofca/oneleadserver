@@ -496,12 +496,19 @@ router.post(
 router.post(
   '/import',
   authorize('admin', 'sales'),
-  upload.single('file'),
+  upload.fields([
+    { name: 'file', maxCount: 1 },
+    { name: 'files', maxCount: 20 },
+  ]),
   asyncHandler(async (req, res) => {
-    if (!req.file) throw badRequest('Excel or CSV file is required');
-    const originalName = String(req.file.originalname || '').toLowerCase();
-    if (!['.xlsx', '.xls', '.csv'].some((ext) => originalName.endsWith(ext))) {
-      throw badRequest('Only .xlsx, .xls, or .csv files are supported');
+    // Accepts one file (`file`) or several (`files`); rows from all files are merged.
+    const files = [...(req.files?.file || []), ...(req.files?.files || [])];
+    if (!files.length) throw badRequest('Excel or CSV file is required');
+    for (const f of files) {
+      const originalName = String(f.originalname || '').toLowerCase();
+      if (!['.xlsx', '.xls', '.csv'].some((ext) => originalName.endsWith(ext))) {
+        throw badRequest(`Only .xlsx, .xls, or .csv files are supported (${f.originalname})`);
+      }
     }
 
     const productIds = [
@@ -515,10 +522,13 @@ router.post(
     const source = cleanText(req.body.source) || 'maps-import';
     const tagIds = parseIds(req.body.tag_ids).map(Number).filter(Boolean);
 
-    const workbook = XLSX.read(req.file.buffer, { type: 'buffer', raw: false });
-    const sheetName = workbook.SheetNames[0];
-    if (!sheetName) throw badRequest('File has no readable sheet or data');
-    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: '' });
+    const rows = [];
+    for (const f of files) {
+      const workbook = XLSX.read(f.buffer, { type: 'buffer', raw: false });
+      const sheetName = workbook.SheetNames[0];
+      if (!sheetName) throw badRequest(`${f.originalname} has no readable sheet or data`);
+      rows.push(...XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { defval: '' }));
+    }
     if (!rows.length) throw badRequest('File has no rows');
 
     const multi = productIds.length > 1;
@@ -678,7 +688,7 @@ router.post(
     await audit(req, {
       entityType: 'lead',
       action: 'import',
-      summary: `Imported ${toInsert.length} lead(s) from ${req.file.originalname}${
+      summary: `Imported ${toInsert.length} lead(s) from ${files.map((f) => f.originalname).join(', ')}${
         linksBackfilled ? `; added Google links to ${linksBackfilled} existing lead(s)` : ''
       }`,
     });
@@ -691,6 +701,7 @@ router.post(
       skipped,
       total: rows.length * productIds.length,
       products: productIds.length,
+      files: files.length,
       auto_assigned: autoAssign ? toInsert.length : 0,
       links_backfilled: linksBackfilled,
     });
